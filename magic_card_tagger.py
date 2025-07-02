@@ -195,12 +195,17 @@ def create_shopify_product(product_data):
 
 def row_to_shopify_product(row):
     # Map DataFrame row to Shopify product format
+    # Set defaults for required Shopify fields
+    status = row.get("Status", "active") or "active"
+    fulfillment_service = row.get("Variant Fulfillment Service", "shopify") or "shopify"
+    inventory_policy = row.get("Variant Inventory Policy", "continue") or "continue"
     product = {
         "title": row.get("Name", ""),
         "body_html": row.get("Body (HTML)", ""),
         "vendor": row.get("Vendor", ""),
         "product_type": row.get("Type", ""),
         "tags": row.get("Tags", ""),
+        "status": status,
         "variants": [
             {
                 "price": row.get("Variant Price", ""),
@@ -208,6 +213,8 @@ def row_to_shopify_product(row):
                 "inventory_quantity": int(row.get("Variant Inventory Qty", 1) or 1),
                 "inventory_management": row.get("Variant Inventory Tracker", "shopify"),
                 "option1": row.get("Option1 Value", "Default Title"),
+                "fulfillment_service": fulfillment_service,
+                "inventory_policy": inventory_policy,
             }
         ]
     }
