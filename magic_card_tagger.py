@@ -4,6 +4,13 @@ import requests
 import io
 import re
 import math
+import os
+import base64
+from dotenv import load_dotenv
+import json
+
+# Use python-dotenv to load .env file
+load_dotenv(dotenv_path="C:/Users/frogm/github_repos/magic-card-tagger/.env")
 
 SCRYFALL_API = "https://api.scryfall.com/cards/named?"
 
@@ -108,6 +115,12 @@ def fetch_card_info(card_name, set_code=None, foil=False):
             usd_price = data.get('prices', {}).get('usd_foil')
         if not usd_price:
             usd_price = data.get('prices', {}).get('usd')
+        # Image URL
+        image_url = ''
+        if 'image_uris' in data and 'normal' in data['image_uris']:
+            image_url = data['image_uris']['normal']
+        elif 'card_faces' in data and isinstance(data['card_faces'], list) and 'image_uris' in data['card_faces'][0]:
+            image_url = data['card_faces'][0]['image_uris'].get('normal', '')
         # Shopify fields
         info = {
             'Handle': card_name.lower().replace(' ', '-'),
@@ -116,7 +129,8 @@ def fetch_card_info(card_name, set_code=None, foil=False):
             'Tags': tags,
             'Rarity (product.metafields.shopify.rarity)': rarity,
             'Color (product.metafields.shopify.color-pattern)': ', '.join(color_names) if colors else 'Colorless',
-            'usd_price': usd_price
+            'usd_price': usd_price,
+            'Image Src': image_url
         }
         return info
     except Exception:
@@ -149,6 +163,58 @@ def parse_txt_to_df(txt):
         # Just card name
         data.append({'Name': line, 'Quantity': 1})
     return pd.DataFrame(data)
+
+def get_shopify_auth_headers():
+    access_token = os.environ.get('SHOPIFY_ADMIN_API_ACCESS_TOKEN')
+    if not access_token:
+        st.error("Shopify Admin API access token not found. Please set SHOPIFY_ADMIN_API_ACCESS_TOKEN in your environment variables.")
+        return None
+    return {
+        "X-Shopify-Access-Token": access_token,
+        "Content-Type": "application/json"
+    }
+
+def get_shopify_base_url():
+    store = os.environ.get('SHOPIFY_STORE')
+    if not store:
+        st.error("Shopify store not found. Please set SHOPIFY_STORE in your environment variables.")
+        return None
+    return f"https://{store}/admin/api/2023-10"
+
+def create_shopify_product(product_data):
+    base_url = get_shopify_base_url()
+    headers = get_shopify_auth_headers()
+    if not base_url or not headers:
+        return False, "Missing Shopify credentials."
+    url = f"{base_url}/products.json"
+    resp = requests.post(url, headers=headers, json={"product": product_data})
+    if resp.status_code == 201:
+        return True, resp.json()
+    else:
+        return False, resp.text
+
+def row_to_shopify_product(row):
+    # Map DataFrame row to Shopify product format
+    product = {
+        "title": row.get("Name", ""),
+        "body_html": row.get("Body (HTML)", ""),
+        "vendor": row.get("Vendor", ""),
+        "product_type": row.get("Type", ""),
+        "tags": row.get("Tags", ""),
+        "variants": [
+            {
+                "price": row.get("Variant Price", ""),
+                "sku": row.get("Variant SKU", ""),
+                "inventory_quantity": int(row.get("Variant Inventory Qty", 1) or 1),
+                "inventory_management": row.get("Variant Inventory Tracker", "shopify"),
+                "option1": row.get("Option1 Value", "Default Title"),
+            }
+        ]
+    }
+    # Optionally add image if present
+    if row.get("Image Src"):
+        product["images"] = [{"src": row["Image Src"]}]
+    return product
 
 def main():
     st.title("Magic Card Tagger")
@@ -201,6 +267,24 @@ def main():
             output = io.StringIO()
             enriched_df.to_csv(output, index=False)
             st.download_button("Download Shopify-style tagged CSV", data=output.getvalue(), file_name="shopify_tagged_cards.csv", mime="text/csv")
+            if 'enriched_df' in locals():
+                st.write("---")
+                if st.button("Upload to Shopify"):
+                    st.info("Uploading products to Shopify...")
+                    results = []
+                    progress = st.progress(0)
+                    for idx, row in enriched_df.iterrows():
+                        product_data = row_to_shopify_product(row)
+                        success, resp = create_shopify_product(product_data)
+                        if success:
+                            results.append(f"✅ {row.get('Name', '')} uploaded.")
+                        else:
+                            results.append(f"❌ {row.get('Name', '')} failed: {resp}")
+                        progress.progress((idx + 1) / len(enriched_df))
+                    st.success("Upload complete!")
+                    st.write("Results:")
+                    for r in results:
+                        st.write(r)
             return
         if not name_col:
             st.error("CSV or TXT must contain a 'name', 'Name', 'title', or 'Title' column or be formatted as 'Quantity Card Name' or 'Card Name, Quantity'.")
@@ -242,6 +326,24 @@ def main():
             output = io.StringIO()
             enriched_df.to_csv(output, index=False)
             st.download_button("Download Shopify-style tagged CSV", data=output.getvalue(), file_name="shopify_tagged_cards.csv", mime="text/csv")
+            if 'enriched_df' in locals():
+                st.write("---")
+                if st.button("Upload to Shopify"):
+                    st.info("Uploading products to Shopify...")
+                    results = []
+                    progress = st.progress(0)
+                    for idx, row in enriched_df.iterrows():
+                        product_data = row_to_shopify_product(row)
+                        success, resp = create_shopify_product(product_data)
+                        if success:
+                            results.append(f"✅ {row.get('Name', '')} uploaded.")
+                        else:
+                            results.append(f"❌ {row.get('Name', '')} failed: {resp}")
+                        progress.progress((idx + 1) / len(enriched_df))
+                    st.success("Upload complete!")
+                    st.write("Results:")
+                    for r in results:
+                        st.write(r)
         else:
             # Use 'Tags' column if it exists, otherwise create it
             tag_col = 'Tags'
@@ -261,6 +363,9 @@ def main():
             output = io.StringIO()
             df.to_csv(output, index=False)
             st.download_button("Download tagged CSV", data=output.getvalue(), file_name="tagged_cards.csv", mime="text/csv")
+
+    print("STORE:", os.environ.get("SHOPIFY_STORE"))
+    print("TOKEN:", os.environ.get("SHOPIFY_ADMIN_API_ACCESS_TOKEN"))
 
 if __name__ == "__main__":
     main()
