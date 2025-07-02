@@ -70,16 +70,15 @@ def fetch_card_tags(card_name, set_code=None):
         colors = data.get('colors', [])
         color_map = {'W': 'White', 'U': 'Blue', 'B': 'Black', 'R': 'Red', 'G': 'Green'}
         if not colors:
-            color_tag = 'Colour: Colorless'
+            color_tags = ['Colour: Colorless']
         else:
-            color_names = [color_map.get(c, c) for c in colors]
-            color_tag = f"Colour: {', '.join(color_names)}"
+            color_tags = [f"Colour: {color_map.get(c, c)}" for c in colors]
         # Card types
         type_line = data.get('type_line', '')
         card_types = [t.strip() for t in type_line.split('—')[0].split() if t[0].isupper()]
         type_tag = f"Type: {' '.join(card_types)}" if card_types else ''
         rarity_tag = f"Rarity: {rarity}" if rarity else ''
-        tags = ', '.join([color_tag, rarity_tag, type_tag])
+        tags = ', '.join(color_tags + [rarity_tag, type_tag])
         return tags
     except Exception:
         return None
@@ -99,16 +98,15 @@ def fetch_card_info(card_name, set_code=None, foil=False):
         colors = data.get('colors', [])
         color_map = {'W': 'White', 'U': 'Blue', 'B': 'Black', 'R': 'Red', 'G': 'Green'}
         if not colors:
-            color_tag = 'Colour: Colorless'
+            color_tags = ['Colour: Colorless']
         else:
-            color_names = [color_map.get(c, c) for c in colors]
-            color_tag = f"Colour: {', '.join(color_names)}"
+            color_tags = [f"Colour: {color_map.get(c, c)}" for c in colors]
         # Card types
         type_line = data.get('type_line', '')
         card_types = [t.strip() for t in type_line.split('—')[0].split() if t[0].isupper()]
         type_tag = f"Type: {' '.join(card_types)}" if card_types else ''
         rarity_tag = f"Rarity: {rarity}" if rarity else ''
-        tags = ', '.join([color_tag, rarity_tag, type_tag])
+        tags = ', '.join(color_tags + [rarity_tag, type_tag])
         # Price
         usd_price = None
         if foil:
@@ -128,7 +126,7 @@ def fetch_card_info(card_name, set_code=None, foil=False):
             'Type': type_line,
             'Tags': tags,
             'Rarity (product.metafields.shopify.rarity)': rarity,
-            'Color (product.metafields.shopify.color-pattern)': ', '.join(color_names) if colors else 'Colorless',
+            'Color (product.metafields.shopify.color-pattern)': ', '.join(color_tags),
             'usd_price': usd_price,
             'Image Src': image_url
         }
