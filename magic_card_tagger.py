@@ -269,6 +269,10 @@ def main():
                         enriched['Variant Price'] = ''
                 else:
                     enriched['Variant Price'] = ''
+                # Set Shopify-required defaults
+                enriched['Status'] = 'active'
+                enriched['Variant Fulfillment Service'] = 'shopify'
+                enriched['Variant Inventory Policy'] = 'continue'
                 enriched_rows.append(enriched)
             enriched_df = pd.DataFrame(enriched_rows, columns=SHOPIFY_COLUMNS)
             output = io.StringIO()
@@ -328,6 +332,10 @@ def main():
                         enriched['Variant Price'] = ''
                 else:
                     enriched['Variant Price'] = ''
+                # Set Shopify-required defaults
+                enriched['Status'] = 'active'
+                enriched['Variant Fulfillment Service'] = 'shopify'
+                enriched['Variant Inventory Policy'] = 'continue'
                 enriched_rows.append(enriched)
             enriched_df = pd.DataFrame(enriched_rows, columns=SHOPIFY_COLUMNS)
             output = io.StringIO()
