@@ -197,7 +197,7 @@ def row_to_shopify_product(row):
     # Map DataFrame row to Shopify product format
     # Set defaults for required Shopify fields
     status = row.get("Status", "active") or "active"
-    fulfillment_service = row.get("Variant Fulfillment Service", "shopify") or "shopify"
+    fulfillment_service = row.get("Variant Fulfillment Service", "manual") or "manual"
     inventory_policy = row.get("Variant Inventory Policy", "continue") or "continue"
     product = {
         "title": row.get("Name", ""),
@@ -271,7 +271,7 @@ def main():
                     enriched['Variant Price'] = ''
                 # Set Shopify-required defaults
                 enriched['Status'] = 'active'
-                enriched['Variant Fulfillment Service'] = 'shopify'
+                enriched['Variant Fulfillment Service'] = 'manual'
                 enriched['Variant Inventory Policy'] = 'continue'
                 enriched_rows.append(enriched)
             enriched_df = pd.DataFrame(enriched_rows, columns=SHOPIFY_COLUMNS)
@@ -334,7 +334,7 @@ def main():
                     enriched['Variant Price'] = ''
                 # Set Shopify-required defaults
                 enriched['Status'] = 'active'
-                enriched['Variant Fulfillment Service'] = 'shopify'
+                enriched['Variant Fulfillment Service'] = 'manual'
                 enriched['Variant Inventory Policy'] = 'continue'
                 enriched_rows.append(enriched)
             enriched_df = pd.DataFrame(enriched_rows, columns=SHOPIFY_COLUMNS)
