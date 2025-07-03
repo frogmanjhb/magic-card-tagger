@@ -1,3 +1,10 @@
+"""
+Magic Card Tagger - Streamlit App
+
+This app enriches Magic card lists with Scryfall data and prepares Shopify-compatible CSVs, with optional direct upload to Shopify via API.
+"""
+
+# 1. Imports and Constants
 import streamlit as st
 import pandas as pd
 import requests
@@ -14,6 +21,7 @@ import time
 load_dotenv(dotenv_path="C:/Users/frogm/github_repos/magic-card-tagger/.env")
 
 SCRYFALL_API = "https://api.scryfall.com/cards/named?"
+FOREX_API = 'https://api.frankfurter.app/latest?from=USD&to=ZAR'
 
 SHOPIFY_COLUMNS = [
     'Handle', 'Name', 'Body (HTML)', 'Vendor', 'Product Category', 'Type', 'Tags', 'Published',
@@ -46,9 +54,10 @@ SHOPIFY_COLUMNS = [
     'Set Name', 'Card Number', 'Rarity'
 ]
 
-FOREX_API = 'https://api.frankfurter.app/latest?from=USD&to=ZAR'
+# 2. Utility Functions
 
 def get_usd_to_zar():
+    """Fetches the current USD to ZAR exchange rate from the Frankfurter API."""
     response = requests.get(FOREX_API)
     try:
         data = response.json()
@@ -57,7 +66,53 @@ def get_usd_to_zar():
         st.error(f"Error fetching forex rate: {e}\nResponse: {response.text}")
         return None
 
+def parse_txt_to_df(txt):
+    """Parses a plain text list of cards into a pandas DataFrame, supporting various input formats."""
+    lines = txt.strip().splitlines()
+    data = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r'^(\d+)\s+(.+?)(?:\s+\([A-Z0-9]+\)\s+\d+)?$', line)
+        if m:
+            qty, name = m.groups()
+            data.append({'Name': name.strip(), 'Quantity': int(qty)})
+            continue
+        m = re.match(r'^(\d+)\s*[xX]?\s+(.+)$', line)
+        if m:
+            qty, name = m.groups()
+            data.append({'Name': name.strip(), 'Quantity': int(qty)})
+            continue
+        m = re.match(r'^(.+),\s*(\d+)$', line)
+        if m:
+            name, qty = m.groups()
+            data.append({'Name': name.strip(), 'Quantity': int(qty)})
+            continue
+        data.append({'Name': line, 'Quantity': 1})
+    return pd.DataFrame(data)
+
+def calculate_price_with_vat(usd_price, usd_to_zar):
+    """Converts USD price to ZAR, adds VAT, and applies price floors (5, 8, 10)."""
+    if usd_price is None or usd_to_zar is None:
+        return ''
+    try:
+        price_zar = float(usd_price) * usd_to_zar * 1.15  # Add 15% VAT
+        if price_zar < 5:
+            return '5'
+        elif price_zar < 8:
+            return '8'
+        elif price_zar < 10:
+            return '10'
+        else:
+            return str(int(math.ceil(price_zar)))
+    except Exception:
+        return ''
+
+# 3. Scryfall Functions
+
 def fetch_card_tags(card_name, set_code=None):
+    """Retrieves card tags (color, rarity, type) from Scryfall for a given card name and set code."""
     try:
         params = {'exact': card_name}
         if set_code:
@@ -86,6 +141,7 @@ def fetch_card_tags(card_name, set_code=None):
         return None
 
 def fetch_card_info(card_name, set_code=None, foil=False):
+    """Retrieves detailed card info from Scryfall (name, type, tags, rarity, color, price, image) for a given card name, set code, and foil status."""
     try:
         params = {'exact': card_name}
         if set_code:
@@ -146,35 +202,22 @@ def fetch_card_info(card_name, set_code=None, foil=False):
     except Exception:
         return None
 
-def parse_txt_to_df(txt):
-    lines = txt.strip().splitlines()
-    data = []
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-        # New: Match 'Quantity Card Name (SET) Number' or 'Quantity Card Name'
-        m = re.match(r'^(\d+)\s+(.+?)(?:\s+\([A-Z0-9]+\)\s+\d+)?$', line)
-        if m:
-            qty, name = m.groups()
-            data.append({'Name': name.strip(), 'Quantity': int(qty)})
-            continue
-        # Try formats: Quantity x Card Name, Quantity Card Name, Card Name, Card Name, Quantity
-        m = re.match(r'^(\d+)\s*[xX]?\s+(.+)$', line)
-        if m:
-            qty, name = m.groups()
-            data.append({'Name': name.strip(), 'Quantity': int(qty)})
-            continue
-        m = re.match(r'^(.+),\s*(\d+)$', line)
-        if m:
-            name, qty = m.groups()
-            data.append({'Name': name.strip(), 'Quantity': int(qty)})
-            continue
-        # Just card name
-        data.append({'Name': line, 'Quantity': 1})
-    return pd.DataFrame(data)
+def build_option1_value(data, foil=False, fallback_card_number=None, fallback_set_name=None):
+    """Constructs the Option1 Value for a variant using Scryfall data and input fallbacks."""
+    collector_number = data.get('collector_number', '') or fallback_card_number or ''
+    set_name = data.get('set_name', '') or fallback_set_name or ''
+    frame_effects = data.get('frame_effects', []) or []
+    option1_value = f"{set_name} #{collector_number}".strip()
+    if foil:
+        option1_value += " (Foil)"
+    if 'boosterfun' in frame_effects:
+        option1_value += " [Boosterfun]"
+    return option1_value
+
+# 4. Shopify API Functions
 
 def get_shopify_auth_headers():
+    """Returns the headers required for authenticating with the Shopify Admin API."""
     access_token = os.environ.get('SHOPIFY_ADMIN_API_ACCESS_TOKEN')
     if not access_token:
         st.error("Shopify Admin API access token not found. Please set SHOPIFY_ADMIN_API_ACCESS_TOKEN in your environment variables.")
@@ -185,6 +228,7 @@ def get_shopify_auth_headers():
     }
 
 def get_shopify_base_url():
+    """Constructs the base URL for the Shopify Admin API using the store environment variable."""
     store = os.environ.get('SHOPIFY_STORE')
     if not store:
         st.error("Shopify store not found. Please set SHOPIFY_STORE in your environment variables.")
@@ -192,6 +236,7 @@ def get_shopify_base_url():
     return f"https://{store}/admin/api/2023-10"
 
 def get_location_id():
+    """Retrieves and caches the Shopify store’s location ID for inventory management."""
     # Cache location_id after first fetch
     if not hasattr(get_location_id, 'location_id'):
         base_url = get_shopify_base_url()
@@ -209,6 +254,7 @@ def get_location_id():
     return get_location_id.location_id
 
 def set_inventory_level(inventory_item_id, available):
+    """Sets the inventory level for a variant at the store’s location using the InventoryLevel API."""
     location_id = get_location_id()
     if not location_id:
         st.warning('Could not fetch Shopify location_id, inventory not updated.')
@@ -226,6 +272,7 @@ def set_inventory_level(inventory_item_id, available):
     return resp.status_code in (200, 201), resp.text
 
 def get_product_images(product_id):
+    """Fetches all images attached to a Shopify product."""
     base_url = get_shopify_base_url()
     headers = get_shopify_auth_headers()
     url = f"{base_url}/products/{product_id}/images.json"
@@ -237,6 +284,7 @@ def get_product_images(product_id):
     return []
 
 def add_image_to_product(product_id, image_url):
+    """Uploads an image to a Shopify product and polls until the image is available."""
     base_url = get_shopify_base_url()
     headers = get_shopify_auth_headers()
     url = f"{base_url}/products/{product_id}/images.json"
@@ -269,6 +317,7 @@ def add_image_to_product(product_id, image_url):
     return image_id
 
 def assign_image_to_variant(variant_id, image_id):
+    """Assigns an uploaded image to a specific variant in Shopify."""
     base_url = get_shopify_base_url()
     headers = get_shopify_auth_headers()
     url = f"{base_url}/variants/{variant_id}.json"
@@ -281,6 +330,7 @@ def assign_image_to_variant(variant_id, image_id):
     return resp.status_code in (200, 201)
 
 def create_shopify_product(product_data):
+    """Creates a new product in Shopify using the provided product data via the Shopify API."""
     base_url = get_shopify_base_url()
     headers = get_shopify_auth_headers()
     if not base_url or not headers:
@@ -311,6 +361,7 @@ def create_shopify_product(product_data):
         return False, resp.text
 
 def row_to_shopify_product(row):
+    """Maps a DataFrame row to the Shopify product/variant format for API upload."""
     # Map DataFrame row to Shopify product format
     # Set defaults for required Shopify fields
     status = row.get("Status", "active") or "active"
@@ -343,6 +394,7 @@ def row_to_shopify_product(row):
     return product
 
 def get_product_variants_by_handle(handle):
+    """Fetches a product and its variants from Shopify by product handle."""
     base_url = get_shopify_base_url()
     headers = get_shopify_auth_headers()
     if not base_url or not headers:
@@ -358,6 +410,7 @@ def get_product_variants_by_handle(handle):
     return None, None
 
 def update_shopify_variant(product_id, variant_id, price, quantity):
+    """Updates a variant’s price, inventory, and image assignment in Shopify."""
     base_url = get_shopify_base_url()
     headers = get_shopify_auth_headers()
     if not base_url or not headers:
@@ -380,6 +433,7 @@ def update_shopify_variant(product_id, variant_id, price, quantity):
         return False, resp.text
 
 def add_shopify_variant(product_id, variant_data):
+    """Adds a new variant to an existing Shopify product and assigns inventory and image."""
     base_url = get_shopify_base_url()
     headers = get_shopify_auth_headers()
     if not base_url or not headers:
@@ -407,18 +461,15 @@ def add_shopify_variant(product_id, variant_data):
     else:
         return False, resp.text
 
-def build_option1_value(data, foil=False, fallback_card_number=None, fallback_set_name=None):
-    collector_number = data.get('collector_number', '') or fallback_card_number or ''
-    set_name = data.get('set_name', '') or fallback_set_name or ''
-    frame_effects = data.get('frame_effects', []) or []
-    option1_value = f"{set_name} #{collector_number}".strip()
-    if foil:
-        option1_value += " (Foil)"
-    if 'boosterfun' in frame_effects:
-        option1_value += " [Boosterfun]"
-    return option1_value
+# 5. Data Enrichment Functions
+# (If you have any additional enrichment helpers, add here)
 
+# 6. Streamlit UI Functions
+# (For preview, warnings, debug output, etc. If needed, add here)
+
+# 7. Main App Logic
 def main():
+    """The main Streamlit app function: handles file upload, enrichment, preview, download, and Shopify upload."""
     st.title("Magic Card Tagger")
     st.write("Upload a CSV or TXT with card names. The app will fill in the Shopify columns with Scryfall data where possible.")
 
@@ -457,13 +508,7 @@ def main():
                 enriched['Variant Inventory Qty'] = row['Count'] if pd.notnull(row['Count']) else 1
                 # Price conversion
                 usd_price = info.get('usd_price')
-                if usd_price and usd_to_zar:
-                    try:
-                        enriched['Variant Price'] = str(int(math.ceil(float(usd_price) * usd_to_zar)))
-                    except Exception:
-                        enriched['Variant Price'] = ''
-                else:
-                    enriched['Variant Price'] = ''
+                enriched['Variant Price'] = calculate_price_with_vat(usd_price, usd_to_zar)
                 # Set Shopify-required defaults
                 enriched['Status'] = 'active'
                 enriched['Variant Fulfillment Service'] = 'manual'
@@ -587,13 +632,7 @@ def main():
                     enriched['Variant Inventory Qty'] = row[qty_col]
                 # Price conversion
                 usd_price = info.get('usd_price')
-                if usd_price and usd_to_zar:
-                    try:
-                        enriched['Variant Price'] = str(int(math.ceil(float(usd_price) * usd_to_zar)))
-                    except Exception:
-                        enriched['Variant Price'] = ''
-                else:
-                    enriched['Variant Price'] = ''
+                enriched['Variant Price'] = calculate_price_with_vat(usd_price, usd_to_zar)
                 # Set Shopify-required defaults
                 enriched['Status'] = 'active'
                 enriched['Variant Fulfillment Service'] = 'manual'
