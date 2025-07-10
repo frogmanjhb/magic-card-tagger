@@ -517,69 +517,64 @@ def add_shopify_variant(product_id, variant_data):
 
 # 7. Main App Logic
 def main():
-    """The main Streamlit app function: handles file upload, enrichment, preview, download, and Shopify upload."""
-    st.title("Magic Card Tagger")
-    st.write("Upload a CSV or TXT with card names. The app will fill in the Shopify columns with Scryfall data where possible.")
+    st.set_page_config(page_title="Magic Card Tagger", layout="wide")
+    st.markdown("""
+        <style>
+        .block-container {padding-top: 2rem;}
+        .stButton>button {width: 100%;}
+        .stDownloadButton>button {width: 100%;}
+        </style>
+    """, unsafe_allow_html=True)
 
-    # --- New Section: Download Shopify CSV for a Magic Set ---
-    st.header("Download Shopify CSV for a Magic Set")
-    sets = fetch_scryfall_sets()
-    if sets:
-        set_options = {f"{s['name']} ({s['code'].upper()})": s['code'] for s in sets}
-        selected_set = st.selectbox("Select a Magic set to download all regular cards:", list(set_options.keys()))
-        if selected_set:
-            set_code = set_options[selected_set]
-            if st.button(f"Fetch and Download All Cards from {selected_set}"):
-                st.info(f"Fetching all regular cards from set {selected_set}...")
-                cards = fetch_all_regular_cards_for_set(set_code)
-                st.success(f"Fetched {len(cards)} cards from {selected_set}.")
-                usd_to_zar = get_usd_to_zar()
+    st.sidebar.title("Magic Card Tagger")
+    st.sidebar.markdown("Enrich Magic card lists or download full sets for Shopify.")
+    page = st.sidebar.radio("Choose a feature:", ["Upload & Enrich Card List", "Download Set as Shopify CSV"])
+
+    if page == "Upload & Enrich Card List":
+        st.header("Upload & Enrich Card List")
+        st.markdown("""
+        Upload a CSV or TXT with card names. The app will fill in the Shopify columns with Scryfall data where possible.
+        """)
+        uploaded_file = st.file_uploader("Choose a CSV or TXT file", type=["csv", "txt"])
+        if uploaded_file:
+            usd_to_zar = get_usd_to_zar()
+            if usd_to_zar:
+                st.info(f"Current USD to ZAR exchange rate: 1 USD = {usd_to_zar:.2f} ZAR")
+            else:
+                st.warning("Could not fetch USD to ZAR exchange rate. Prices will not be converted.")
+            if uploaded_file.name.lower().endswith('.txt'):
+                txt = uploaded_file.read().decode('utf-8')
+                df = parse_txt_to_df(txt)
+            else:
+                df = pd.read_csv(uploaded_file)
+            # Accept 'name', 'Name', 'title', or 'Title' as the card name column
+            name_col = None
+            for col in ['name', 'Name', 'title', 'Title']:
+                if col in df.columns:
+                    name_col = col
+                    break
+            # Deckbox-style columns
+            is_deckbox = all(col in df.columns for col in ['Name', 'Count', 'Edition Code'])
+            if is_deckbox:
                 enriched_rows = []
-                for card in cards:
-                    # Use your enrichment logic to build a Shopify row
-                    info = {}
-                    # Simulate fetch_card_info output structure
-                    rarity = card.get('rarity', '').capitalize()
-                    colors = card.get('colors', [])
-                    color_map = {'W': 'White', 'U': 'Blue', 'B': 'Black', 'R': 'Red', 'G': 'Green'}
-                    if not colors:
-                        color_tags = ['Colour: Colorless']
-                    else:
-                        color_tags = [f"Colour: {color_map.get(c, c)}" for c in colors]
-                    type_line = card.get('type_line', '')
-                    card_types = [t.strip() for t in type_line.split('—')[0].split() if t and t[0].isupper()]
-                    type_tag = f"Type: {' '.join(card_types)}" if card_types else ''
-                    rarity_tag = f"Rarity: {rarity}" if rarity else ''
-                    tags = ', '.join(color_tags + [rarity_tag, type_tag])
-                    usd_price = card.get('prices', {}).get('usd')
-                    image_url = ''
-                    if 'image_uris' in card and 'png' in card['image_uris']:
-                        image_url = card['image_uris']['png']
-                    elif 'card_faces' in card and isinstance(card['card_faces'], list) and 'image_uris' in card['card_faces'][0] and 'png' in card['card_faces'][0]['image_uris']:
-                        image_url = card['card_faces'][0]['image_uris'].get('png', '')
-                    info = {
-                        'Handle': card['name'].lower().replace(' ', '-'),
-                        'Name': card.get('name', ''),
-                        'Type': type_line,
-                        'Tags': tags,
-                        'Rarity (product.metafields.shopify.rarity)': rarity,
-                        'Color (product.metafields.shopify.color-pattern)': ', '.join(color_tags),
-                        'usd_price': usd_price,
-                        'Image Src': image_url,
-                        'Variant Image': image_url,
-                        'Set Name': card.get('set_name', ''),
-                        'Card Number': card.get('collector_number', ''),
-                        'Rarity': rarity
-                    }
+                for idx, row in df.iterrows():
+                    card_name = row['Name']
+                    set_code = row['Edition Code'] if pd.notnull(row['Edition Code']) else None
+                    foil = False
+                    if 'Foil' in row and str(row['Foil']).strip().lower() in ['yes', 'true', '1']:
+                        foil = True
+                    info = fetch_card_info(card_name, set_code, foil) or {}
                     enriched = {col: '' for col in SHOPIFY_COLUMNS}
                     enriched.update(info)
-                    enriched['Variant Inventory Qty'] = 1
+                    enriched['Name'] = card_name
+                    enriched['Variant Inventory Qty'] = row['Count'] if pd.notnull(row['Count']) else 1
+                    usd_price = info.get('usd_price')
                     enriched['Variant Price'] = calculate_price_with_vat(usd_price, usd_to_zar)
                     enriched['Status'] = 'draft'
                     enriched['Variant Fulfillment Service'] = 'manual'
                     enriched['Variant Inventory Policy'] = 'deny'
                     enriched['Vendor'] = 'Top Deck'
-                    enriched['Product Category'] = 'Uncategorized'
+                    enriched['Product Category'] = 'Gaming Cards'
                     enriched['Published'] = 'TRUE'
                     enriched['Option1 Name'] = 'Version'
                     enriched['Variant Grams'] = 2
@@ -588,180 +583,298 @@ def main():
                     enriched['Variant Taxable'] = 'TRUE'
                     enriched['Gift Card'] = 'FALSE'
                     enriched['Variant Weight Unit'] = 'g'
-                    # Option1 Value = set name
-                    enriched['Option1 Value'] = card.get('set_name', '')
+                    fallback_card_number = row.get('Card Number', '') if 'Card Number' in row else None
+                    fallback_set_name = row.get('Edition', '') if 'Edition' in row else None
+                    if info:
+                        enriched['Option1 Value'] = build_option1_value(info, foil, fallback_card_number, fallback_set_name)
+                    else:
+                        enriched['Option1 Value'] = build_option1_value({}, foil, fallback_card_number, fallback_set_name)
+                    if info:
+                        enriched['Set Name'] = info.get('set_name', '') or row.get('Edition', '')
+                        enriched['Card Number'] = info.get('collector_number', '') or fallback_card_number
+                        enriched['Rarity'] = info.get('rarity', '')
+                        rarity_tag = f"Rarity: {info.get('rarity', '').capitalize()}"
+                        if 'Tags' in enriched and rarity_tag not in enriched['Tags']:
+                            enriched['Tags'] = f"{enriched['Tags']}, {rarity_tag}" if enriched['Tags'] else rarity_tag
+                    enriched['Variant Image'] = enriched.get('Image Src', '')
                     enriched_rows.append(enriched)
                 enriched_df = pd.DataFrame(enriched_rows, columns=SHOPIFY_COLUMNS)
-                st.write('Preview (first 10 cards):')
-                st.dataframe(enriched_df[['Name', 'Set Name', 'Card Number', 'Option1 Value']].head(10))
+                st.subheader('Preview of Option1 Value (first 10 rows):')
+                st.dataframe(enriched_df[['Name', 'Set Name', 'Card Number', 'Option1 Value']].head(10), use_container_width=True)
+                if enriched_df['Option1 Value'].isnull().any() or (enriched_df['Option1 Value'] == '').any():
+                    st.warning('Some rows are missing Option1 Value. Please check your input or Scryfall data.')
                 output = io.StringIO()
                 enriched_df.to_csv(output, index=False)
-                st.download_button(f"Download Shopify CSV for {selected_set}", data=output.getvalue(), file_name=f"shopify_{set_code}_cards.csv", mime="text/csv")
-    else:
-        st.warning("Could not fetch Magic sets from Scryfall.")
-
-    # --- Existing Section: File Upload ---
-    uploaded_file = st.file_uploader("Choose a CSV or TXT file", type=["csv", "txt"])
-    if uploaded_file:
-        usd_to_zar = get_usd_to_zar()
-        if usd_to_zar:
-            st.info(f"Current USD to ZAR exchange rate: 1 USD = {usd_to_zar:.2f} ZAR")
-        else:
-            st.warning("Could not fetch USD to ZAR exchange rate. Prices will not be converted.")
-        if uploaded_file.name.lower().endswith('.txt'):
-            txt = uploaded_file.read().decode('utf-8')
-            df = parse_txt_to_df(txt)
-        else:
-            df = pd.read_csv(uploaded_file)
-        # Accept 'name', 'Name', 'title', or 'Title' as the card name column
-        name_col = None
-        for col in ['name', 'Name', 'title', 'Title']:
-            if col in df.columns:
-                name_col = col
-                break
-        # Deckbox-style columns
-        is_deckbox = all(col in df.columns for col in ['Name', 'Count', 'Edition Code'])
-        if is_deckbox:
-            enriched_rows = []
-            for idx, row in df.iterrows():
-                card_name = row['Name']
-                set_code = row['Edition Code'] if pd.notnull(row['Edition Code']) else None
-                foil = False
-                if 'Foil' in row and str(row['Foil']).strip().lower() in ['yes', 'true', '1']:
-                    foil = True
-                info = fetch_card_info(card_name, set_code, foil) or {}
-                enriched = {col: '' for col in SHOPIFY_COLUMNS}
-                enriched.update(info)
-                enriched['Name'] = card_name
-                enriched['Variant Inventory Qty'] = row['Count'] if pd.notnull(row['Count']) else 1
-                # Price conversion
-                usd_price = info.get('usd_price')
-                enriched['Variant Price'] = calculate_price_with_vat(usd_price, usd_to_zar)
-                # Set Shopify-required defaults
-                enriched['Status'] = 'draft'
-                enriched['Variant Fulfillment Service'] = 'manual'
-                enriched['Variant Inventory Policy'] = 'deny'
-                # Set user-specified defaults
-                enriched['Vendor'] = 'Top Deck'
-                enriched['Product Category'] = 'Uncategorized'
-                enriched['Published'] = 'TRUE'
-                enriched['Option1 Name'] = 'Version'
-                enriched['Variant Grams'] = 2
-                enriched['Variant Inventory Tracker'] = 'shopify'
-                enriched['Variant Requires Shipping'] = 'TRUE'
-                enriched['Variant Taxable'] = 'TRUE'
-                enriched['Gift Card'] = 'FALSE'
-                enriched['Variant Weight Unit'] = 'g'
-                # Set Option1 Value using Scryfall data or fallback to input Card Number
-                fallback_card_number = row.get('Card Number', '') if 'Card Number' in row else None
-                fallback_set_name = row.get('Edition', '') if 'Edition' in row else None
-                if info:
-                    enriched['Option1 Value'] = build_option1_value(info, foil, fallback_card_number, fallback_set_name)
-                else:
-                    enriched['Option1 Value'] = build_option1_value({}, foil, fallback_card_number, fallback_set_name)
-                # Set Scryfall info columns, fallback to Edition for Set Name
-                if info:
-                    enriched['Set Name'] = info.get('set_name', '') or row.get('Edition', '')
-                    enriched['Card Number'] = info.get('collector_number', '') or fallback_card_number
-                    enriched['Rarity'] = info.get('rarity', '')
-                    # Add rarity to Tags if not already present
-                    rarity_tag = f"Rarity: {info.get('rarity', '').capitalize()}"
-                    if 'Tags' in enriched and rarity_tag not in enriched['Tags']:
-                        enriched['Tags'] = f"{enriched['Tags']}, {rarity_tag}" if enriched['Tags'] else rarity_tag
-                # Set Variant Image to match Image Src
-                enriched['Variant Image'] = enriched.get('Image Src', '')
-                enriched_rows.append(enriched)
-            enriched_df = pd.DataFrame(enriched_rows, columns=SHOPIFY_COLUMNS)
-            # Show preview of Option1 Value
-            st.write('Preview of Option1 Value (first 10 rows):')
-            st.dataframe(enriched_df[['Name', 'Set Name', 'Card Number', 'Option1 Value']].head(10))
-            # Show warning if any Option1 Value is missing
-            if enriched_df['Option1 Value'].isnull().any() or (enriched_df['Option1 Value'] == '').any():
-                st.warning('Some rows are missing Option1 Value. Please check your input or Scryfall data.')
-            output = io.StringIO()
-            enriched_df.to_csv(output, index=False)
-            st.download_button("Download Shopify-style tagged CSV", data=output.getvalue(), file_name="shopify_tagged_cards.csv", mime="text/csv")
-            if 'enriched_df' in locals():
-                st.write("---")
-                if st.button("Upload to Shopify"):
-                    st.info("Uploading products to Shopify...")
-                    results = []
-                    progress = st.progress(0)
-                    for handle, group in enriched_df.groupby('Handle'):
-                        product, existing_variants = get_product_variants_by_handle(handle)
-                        # Normalize existing variant keys for robust matching
-                        normalized_existing_variants = {}
-                        if existing_variants:
-                            for k, v in existing_variants.items():
-                                norm_k = str(k).strip().lower()
-                                normalized_existing_variants[norm_k] = v
-                        if not product:
-                            # Product does not exist, create with all variants
-                            first_row = group.iloc[0]
-                            product_data = row_to_shopify_product(first_row)
-                            # Add all variants
-                            product_data['variants'] = []
-                            for _, row in group.iterrows():
-                                variant = row_to_shopify_product(row)['variants'][0]
-                                product_data['variants'].append(variant)
-                            success, resp = create_shopify_product(product_data)
-                            if success:
-                                results.append(f"✅ {handle} created with {len(group)} variants.")
-                            else:
-                                results.append(f"❌ {handle} create failed: {resp}")
-                        else:
-                            # Product exists, update or add variants
-                            product_id = product['id']
-                            for _, row in group.iterrows():
-                                variant = row_to_shopify_product(row)['variants'][0]
-                                option1_value = str(variant['option1']).strip().lower()
-                                st.write(f"Checking for existing variant: '{option1_value}' in {list(normalized_existing_variants.keys())}")
-                                if option1_value in normalized_existing_variants:
-                                    # Update existing variant
-                                    variant_id = normalized_existing_variants[option1_value]['id']
-                                    price = variant.get('price', normalized_existing_variants[option1_value]['price'])
-                                    quantity = variant.get('inventory_quantity', normalized_existing_variants[option1_value]['inventory_quantity'])
-                                    st.write(f"Updating variant '{option1_value}' (ID: {variant_id}) with price {price} and quantity {quantity}")
-                                    success, resp = update_shopify_variant(product_id, variant_id, price, quantity)
-                                    if success:
-                                        results.append(f"📝 {handle} - {variant['option1']} updated.")
-                                    else:
-                                        results.append(f"❌ {handle} - {variant['option1']} update failed: {resp}")
+                st.download_button("Download Shopify-style tagged CSV", data=output.getvalue(), file_name="shopify_tagged_cards.csv", mime="text/csv")
+                st.markdown("---")
+                with st.expander("Upload to Shopify (Advanced)"):
+                    if st.button("Upload to Shopify"):
+                        st.info("Uploading products to Shopify...")
+                        results = []
+                        progress = st.progress(0)
+                        for handle, group in enriched_df.groupby('Handle'):
+                            product, existing_variants = get_product_variants_by_handle(handle)
+                            normalized_existing_variants = {}
+                            if existing_variants:
+                                for k, v in existing_variants.items():
+                                    norm_k = str(k).strip().lower()
+                                    normalized_existing_variants[norm_k] = v
+                            if not product:
+                                first_row = group.iloc[0]
+                                product_data = row_to_shopify_product(first_row)
+                                product_data['variants'] = []
+                                for _, row in group.iterrows():
+                                    variant = row_to_shopify_product(row)['variants'][0]
+                                    product_data['variants'].append(variant)
+                                success, resp = create_shopify_product(product_data)
+                                if success:
+                                    results.append(f"✅ {handle} created with {len(group)} variants.")
                                 else:
-                                    # Add new variant
-                                    st.write(f"Adding new variant '{variant['option1']}' to product {handle}")
-                                    success, resp = add_shopify_variant(product_id, variant)
-                                    if success:
-                                        results.append(f"➕ {handle} - {variant['option1']} added.")
+                                    results.append(f"❌ {handle} create failed: {resp}")
+                            else:
+                                product_id = product['id']
+                                for _, row in group.iterrows():
+                                    variant = row_to_shopify_product(row)['variants'][0]
+                                    option1_value = str(variant['option1']).strip().lower()
+                                    st.write(f"Checking for existing variant: '{option1_value}' in {list(normalized_existing_variants.keys())}")
+                                    if option1_value in normalized_existing_variants:
+                                        variant_id = normalized_existing_variants[option1_value]['id']
+                                        price = variant.get('price', normalized_existing_variants[option1_value]['price'])
+                                        quantity = variant.get('inventory_quantity', normalized_existing_variants[option1_value]['inventory_quantity'])
+                                        st.write(f"Updating variant '{option1_value}' (ID: {variant_id}) with price {price} and quantity {quantity}")
+                                        success, resp = update_shopify_variant(product_id, variant_id, price, quantity)
+                                        if success:
+                                            results.append(f"📝 {handle} - {variant['option1']} updated.")
+                                        else:
+                                            results.append(f"❌ {handle} - {variant['option1']} update failed: {resp}")
                                     else:
-                                        results.append(f"❌ {handle} - {variant['option1']} add failed: {resp}")
-                        progress.progress((list(enriched_df['Handle']).index(handle) + 1) / len(enriched_df['Handle'].unique()))
-                    st.success("Upload complete!")
-                    st.write("Results:")
-                    for r in results:
-                        st.write(r)
+                                        st.write(f"Adding new variant '{variant['option1']}' to product {handle}")
+                                        success, resp = add_shopify_variant(product_id, variant)
+                                        if success:
+                                            results.append(f"➕ {handle} - {variant['option1']} added.")
+                                        else:
+                                            results.append(f"❌ {handle} - {variant['option1']} add failed: {resp}")
+                            progress.progress((list(enriched_df['Handle']).index(handle) + 1) / len(enriched_df['Handle'].unique()))
+                        st.success("Upload complete!")
+                        st.write("Results:")
+                        for r in results:
+                            st.write(r)
+                return
+            if not name_col:
+                st.error("CSV or TXT must contain a 'name', 'Name', 'title', or 'Title' column or be formatted as 'Quantity Card Name' or 'Card Name, Quantity'.")
+                return
+            set_col = None
+            for col in ['Edition Code', 'Set Code', 'set', 'Set']:
+                if col in df.columns:
+                    set_col = col
+                    break
+            if set_col and set_col in df.columns:
+                enriched_rows = []
+                for idx, row in df.iterrows():
+                    card_name = row[name_col]
+                    set_code = row[set_col] if set_col and set_col in row and pd.notnull(row[set_col]) else None
+                    foil = False
+                    if 'Foil' in row and str(row['Foil']).strip().lower() in ['yes', 'true', '1']:
+                        foil = True
+                    info = fetch_card_info(card_name, set_code, foil) or {}
+                    enriched = {col: '' for col in SHOPIFY_COLUMNS}
+                    enriched.update(info)
+                    qty_col = 'quantity' if 'quantity' in df.columns else 'Quantity' if 'Quantity' in df.columns else None
+                    if qty_col:
+                        enriched['Variant Inventory Qty'] = row[qty_col]
+                    usd_price = info.get('usd_price')
+                    enriched['Variant Price'] = calculate_price_with_vat(usd_price, usd_to_zar)
+                    enriched['Status'] = 'draft'
+                    enriched['Variant Fulfillment Service'] = 'manual'
+                    enriched['Variant Inventory Policy'] = 'deny'
+                    enriched['Vendor'] = 'Top Deck'
+                    enriched['Product Category'] = 'Gaming Cards'
+                    enriched['Published'] = 'TRUE'
+                    enriched['Option1 Name'] = 'Version'
+                    enriched['Variant Grams'] = 2
+                    enriched['Variant Inventory Tracker'] = 'shopify'
+                    enriched['Variant Requires Shipping'] = 'TRUE'
+                    enriched['Variant Taxable'] = 'TRUE'
+                    enriched['Gift Card'] = 'FALSE'
+                    enriched['Variant Weight Unit'] = 'g'
+                    fallback_card_number = row.get('Card Number', '') if 'Card Number' in row else None
+                    fallback_set_name = row.get('Edition', '') if 'Edition' in row else None
+                    if info:
+                        enriched['Option1 Value'] = build_option1_value(info, foil, fallback_card_number, fallback_set_name)
+                    else:
+                        enriched['Option1 Value'] = build_option1_value({}, foil, fallback_card_number, fallback_set_name)
+                    if info:
+                        enriched['Set Name'] = info.get('set_name', '') or row.get('Edition', '')
+                        enriched['Card Number'] = info.get('collector_number', '') or fallback_card_number
+                        enriched['Rarity'] = info.get('rarity', '')
+                        rarity_tag = f"Rarity: {info.get('rarity', '').capitalize()}"
+                        if 'Tags' in enriched and rarity_tag not in enriched['Tags']:
+                            enriched['Tags'] = f"{enriched['Tags']}, {rarity_tag}" if enriched['Tags'] else rarity_tag
+                    else:
+                        enriched['Set Name'] = row.get('Edition', '')
+                        enriched['Card Number'] = fallback_card_number
+                    enriched['Variant Image'] = enriched.get('Image Src', '')
+                    enriched_rows.append(enriched)
+                enriched_df = pd.DataFrame(enriched_rows, columns=SHOPIFY_COLUMNS)
+                st.subheader('Preview of Option1 Value (first 10 rows):')
+                st.dataframe(enriched_df[['Name', 'Set Name', 'Card Number', 'Option1 Value']].head(10), use_container_width=True)
+                if enriched_df['Option1 Value'].isnull().any() or (enriched_df['Option1 Value'] == '').any():
+                    st.warning('Some rows are missing Option1 Value. Please check your input or Scryfall data.')
+                output = io.StringIO()
+                enriched_df.to_csv(output, index=False)
+                st.download_button("Download Shopify-style tagged CSV", data=output.getvalue(), file_name="shopify_tagged_cards.csv", mime="text/csv")
+                st.markdown("---")
+                with st.expander("Upload to Shopify (Advanced)"):
+                    if st.button("Upload to Shopify"):
+                        st.info("Uploading products to Shopify...")
+                        results = []
+                        progress = st.progress(0)
+                        for handle, group in enriched_df.groupby('Handle'):
+                            product, existing_variants = get_product_variants_by_handle(handle)
+                            if not product:
+                                first_row = group.iloc[0]
+                                product_data = row_to_shopify_product(first_row)
+                                product_data['variants'] = []
+                                for _, row in group.iterrows():
+                                    variant = row_to_shopify_product(row)['variants'][0]
+                                    product_data['variants'].append(variant)
+                                success, resp = create_shopify_product(product_data)
+                                if success:
+                                    results.append(f"✅ {handle} created with {len(group)} variants.")
+                                else:
+                                    results.append(f"❌ {handle} create failed: {resp}")
+                            else:
+                                product_id = product['id']
+                                for _, row in group.iterrows():
+                                    variant = row_to_shopify_product(row)['variants'][0]
+                                    option1_value = variant['option1']
+                                    if option1_value in existing_variants:
+                                        variant_id = existing_variants[option1_value]['id']
+                                        price = variant.get('price', existing_variants[option1_value]['price'])
+                                        quantity = variant.get('inventory_quantity', existing_variants[option1_value]['inventory_quantity'])
+                                        success, resp = update_shopify_variant(product_id, variant_id, price, quantity)
+                                        if success:
+                                            results.append(f"📝 {handle} - {option1_value} updated.")
+                                        else:
+                                            results.append(f"❌ {handle} - {option1_value} update failed: {resp}")
+                                    else:
+                                        success, resp = add_shopify_variant(product_id, variant)
+                                        if success:
+                                            results.append(f"➕ {handle} - {option1_value} added.")
+                                        else:
+                                            results.append(f"❌ {handle} - {option1_value} add failed: {resp}")
+                            progress.progress((list(enriched_df['Handle']).index(handle) + 1) / len(enriched_df['Handle'].unique()))
+                        st.success("Upload complete!")
+                        st.write("Results:")
+                        for r in results:
+                            st.write(r)
+            else:
+                tag_col = 'Tags'
+                if tag_col not in df.columns:
+                    df[tag_col] = ''
+                progress = st.progress(0)
+                for idx, row in df.iterrows():
+                    set_code = row[set_col] if set_col and set_col in row and pd.notnull(row[set_col]) else None
+                    foil = False
+                    if 'Foil' in row and str(row['Foil']).strip().lower() in ['yes', 'true', '1']:
+                        foil = True
+                    tags = fetch_card_tags(row[name_col], set_code)
+                    if tags:
+                        df.at[idx, tag_col] = tags
+                    progress.progress((idx + 1) / len(df))
+                st.success("Tags populated!")
+                output = io.StringIO()
+                df.to_csv(output, index=False)
+                st.download_button("Download tagged CSV", data=output.getvalue(), file_name="tagged_cards.csv", mime="text/csv")
+
+    elif page == "Download Set as Shopify CSV":
+        st.header("Download Set as Shopify CSV")
+        st.markdown("""
+        Select a Magic set to download all regular cards as a Shopify-enriched CSV. Only regular cards (not tokens, promos, or digital-only) are included.
+        """)
+        sets = fetch_scryfall_sets()
+        if sets:
+            set_options = {f"{s['name']} ({s['code'].upper()})": s['code'] for s in sets}
+            selected_set = st.selectbox("Select a Magic set:", list(set_options.keys()))
+            if selected_set:
+                set_code = set_options[selected_set]
+                if st.button(f"Fetch and Download All Cards from {selected_set}"):
+                    st.info(f"Fetching all regular cards from set {selected_set}...")
+                    cards = fetch_all_regular_cards_for_set(set_code)
+                    st.success(f"Fetched {len(cards)} cards from {selected_set}.")
+                    usd_to_zar = get_usd_to_zar()
+                    enriched_rows = []
+                    for card in cards:
+                        rarity = card.get('rarity', '').capitalize()
+                        colors = card.get('colors', [])
+                        color_map = {'W': 'White', 'U': 'Blue', 'B': 'Black', 'R': 'Red', 'G': 'Green'}
+                        if not colors:
+                            color_tags = ['Colour: Colorless']
+                        else:
+                            color_tags = [f"Colour: {color_map.get(c, c)}" for c in colors]
+                        type_line = card.get('type_line', '')
+                        card_types = [t.strip() for t in type_line.split('—')[0].split() if t and t[0].isupper()]
+                        type_tag = f"Type: {' '.join(card_types)}" if card_types else ''
+                        rarity_tag = f"Rarity: {rarity}" if rarity else ''
+                        tags = ', '.join(color_tags + [rarity_tag, type_tag])
+                        usd_price = card.get('prices', {}).get('usd')
+                        image_url = ''
+                        if 'image_uris' in card and 'png' in card['image_uris']:
+                            image_url = card['image_uris']['png']
+                        elif 'card_faces' in card and isinstance(card['card_faces'], list) and 'image_uris' in card['card_faces'][0] and 'png' in card['card_faces'][0]['image_uris']:
+                            image_url = card['card_faces'][0]['image_uris'].get('png', '')
+                        info = {
+                            'Handle': card['name'].lower().replace(' ', '-'),
+                            'Name': card.get('name', ''),
+                            'Type': type_line,
+                            'Tags': tags,
+                            'Rarity (product.metafields.shopify.rarity)': rarity,
+                            'Color (product.metafields.shopify.color-pattern)': ', '.join(color_tags),
+                            'usd_price': usd_price,
+                            'Image Src': image_url,
+                            'Variant Image': image_url,
+                            'Set Name': card.get('set_name', ''),
+                            'Card Number': card.get('collector_number', ''),
+                            'Rarity': rarity
+                        }
+                        enriched = {col: '' for col in SHOPIFY_COLUMNS}
+                        enriched.update(info)
+                        enriched['Variant Inventory Qty'] = 1
+                        enriched['Variant Price'] = calculate_price_with_vat(usd_price, usd_to_zar)
+                        enriched['Status'] = 'draft'
+                        enriched['Variant Fulfillment Service'] = 'manual'
+                        enriched['Variant Inventory Policy'] = 'deny'
+                        enriched['Vendor'] = 'Top Deck'
+                        enriched['Product Category'] = 'Gaming Cards'
+                        enriched['Published'] = 'TRUE'
+                        enriched['Option1 Name'] = 'Version'
+                        enriched['Variant Grams'] = 2
+                        enriched['Variant Inventory Tracker'] = 'shopify'
+                        enriched['Variant Requires Shipping'] = 'TRUE'
+                        enriched['Variant Taxable'] = 'TRUE'
+                        enriched['Gift Card'] = 'FALSE'
+                        enriched['Variant Weight Unit'] = 'g'
+                        enriched['Option1 Value'] = card.get('set_name', '')
+                        enriched_rows.append(enriched)
+                    enriched_df = pd.DataFrame(enriched_rows, columns=SHOPIFY_COLUMNS)
+                    st.subheader('Preview (first 10 cards):')
+                    st.dataframe(enriched_df[['Name', 'Set Name', 'Card Number', 'Option1 Value']].head(10), use_container_width=True)
+                    output = io.StringIO()
+                    enriched_df.to_csv(output, index=False)
+                    st.download_button(f"Download Shopify CSV for {selected_set}", data=output.getvalue(), file_name=f"shopify_{set_code}_cards.csv", mime="text/csv")
         else:
-            # Use 'Tags' column if it exists, otherwise create it
-            tag_col = 'Tags'
-            if tag_col not in df.columns:
-                df[tag_col] = ''
-            progress = st.progress(0)
-            for idx, row in df.iterrows():
-                set_code = row[set_col] if set_col and set_col in row and pd.notnull(row[set_col]) else None
-                foil = False
-                if 'Foil' in row and str(row['Foil']).strip().lower() in ['yes', 'true', '1']:
-                    foil = True
-                tags = fetch_card_tags(row[name_col], set_code)
-                if tags:
-                    df.at[idx, tag_col] = tags
-                progress.progress((idx + 1) / len(df))
-            st.success("Tags populated!")
-            output = io.StringIO()
-            df.to_csv(output, index=False)
-            st.download_button("Download tagged CSV", data=output.getvalue(), file_name="tagged_cards.csv", mime="text/csv")
+            st.warning("Could not fetch Magic sets from Scryfall.")
 
     print("STORE:", os.environ.get("SHOPIFY_STORE"))
     print("TOKEN:", os.environ.get("SHOPIFY_ADMIN_API_ACCESS_TOKEN"))
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "runnow":
+        import subprocess
+        import os
+        # Relaunch as streamlit app
+        cmd = [sys.executable, '-m', 'streamlit', 'run', os.path.abspath(__file__)]
+        subprocess.run(cmd)
+    else:
+        main()
