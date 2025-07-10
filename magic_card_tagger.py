@@ -526,6 +526,14 @@ def main():
         </style>
     """, unsafe_allow_html=True)
 
+    # --- Sidebar with logo ---
+    # Instruct user to place logo.png in the project directory
+    import os
+    logo_path = os.path.join(os.path.dirname(__file__), 'logo.png')
+    if os.path.exists(logo_path):
+        st.sidebar.image(logo_path, use_column_width=True)
+    else:
+        st.sidebar.info('To display the logo, download it from [this link](https://drive.google.com/file/d/1zTe-hfoDw8s3GPTOWnyv76RFyF6mpN_c/view?usp=sharing) and save as logo.png in the app folder.')
     st.sidebar.title("Magic Card Tagger")
     st.sidebar.markdown("Enrich Magic card lists or download full sets for Shopify.")
     page = st.sidebar.radio("Choose a feature:", ["Upload & Enrich Card List", "Download Set as Shopify CSV"])
