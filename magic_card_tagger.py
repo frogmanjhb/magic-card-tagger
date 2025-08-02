@@ -172,7 +172,8 @@ def fetch_card_tags(card_name, set_code=None):
 def fetch_card_info(card_name, set_code=None, foil=False):
     """Retrieves detailed card info from Scryfall (name, type, tags, rarity, color, price, image) for a given card name, set code, and foil status."""
     try:
-        params = {'exact': card_name}
+        # Use fuzzy search instead of exact match for better results
+        params = {'fuzzy': card_name}
         if set_code:
             params['set'] = set_code.lower()
         response = requests.get(SCRYFALL_API, params=params)
@@ -196,10 +197,16 @@ def fetch_card_info(card_name, set_code=None, foil=False):
         tags = ', '.join(color_tags + [rarity_tag, type_tag])
         # Price
         usd_price = None
+        prices = data.get('prices', {})
+        
         if foil:
-            usd_price = data.get('prices', {}).get('usd_foil')
-        if not usd_price:
-            usd_price = data.get('prices', {}).get('usd')
+            usd_price = prices.get('usd_foil')
+            if not usd_price:
+                usd_price = prices.get('usd')  # Fallback to regular price for foil
+        else:
+            usd_price = prices.get('usd')
+            if not usd_price:
+                usd_price = prices.get('usd_foil')  # Fallback to foil price for regular
         # Image URL
         image_url = ''
         if 'image_uris' in data and 'png' in data['image_uris']:
@@ -515,6 +522,220 @@ def add_shopify_variant(product_id, variant_data):
 # 6. Streamlit UI Functions
 # (For preview, warnings, debug output, etc. If needed, add here)
 
+def adjust_shopify_csv_with_counts(count_df, shopify_df):
+    """Adjust Shopify CSV inventory quantities based on count data."""
+    adjusted_df = shopify_df.copy()
+    matches_found = 0
+    
+
+
+    # Find the correct column name for card number
+    card_number_col = None
+    for col in ['collector_number', 'Card Number', 'card number', 'card number ', 'Card Number', 'card_number', 'CardNumber', 'Number', 'number']:
+        if col in count_df.columns:
+            card_number_col = col
+            break
+    
+    if card_number_col is None:
+        print(f"Available columns in count sheet: {list(count_df.columns)}")
+        raise ValueError("Could not find collector number column. Available columns: " + str(list(count_df.columns)))
+
+    print(f"Using column '{card_number_col}' for collector numbers")
+
+    for _, count_row in count_df.iterrows():
+        try:
+            # Handle potential NaN values in card_name
+            card_name_raw = count_row['card_name']
+            if pd.isna(card_name_raw):
+                print(f"Skipping row with NaN card_name")
+                continue
+            card_name = str(card_name_raw)
+            
+            # Convert card_name to handle format
+            import re
+            handle = card_name.lower()
+            handle = re.sub(r'[^\w\s-]', '', handle)  # Remove special characters except spaces and hyphens
+            handle = re.sub(r'\s+', '-', handle)  # Replace spaces with hyphens
+            handle = re.sub(r'-+', '-', handle)  # Replace multiple hyphens with single hyphen
+            handle = handle.strip('-')  # Remove leading/trailing hyphens
+            
+            # Handle potential NaN values in collector number
+            card_number_raw = count_row[card_number_col]
+            if pd.isna(card_number_raw):
+                print(f"Skipping {card_name} - NaN collector number")
+                continue
+            card_number = str(card_number_raw).strip()
+            
+            # Debug the raw values
+            raw_regular = count_row['inventory_quantity']
+            raw_foil = count_row['Foil inventory_quantity']
+            print(f"\nRaw values for {card_name}:")
+            print(f"  Card name: '{card_name}'")
+            print(f"  Converted handle: '{handle}'")
+            print(f"  Raw regular: '{raw_regular}' (type: {type(raw_regular)})")
+            print(f"  Raw foil: '{raw_foil}' (type: {type(raw_foil)})")
+            
+            # Handle NaN values in counts
+            if pd.isna(raw_regular) or str(raw_regular).strip() == '':
+                regular_count = 0
+            else:
+                try:
+                    regular_count = int(float(raw_regular))
+                except (ValueError, TypeError):
+                    regular_count = 0
+                    
+            if pd.isna(raw_foil) or str(raw_foil).strip() == '':
+                foil_count = 0
+            else:
+                try:
+                    foil_count = int(float(raw_foil))
+                except (ValueError, TypeError):
+                    foil_count = 0
+            
+            print(f"  Converted regular: {regular_count} (type: {type(regular_count)})")
+            print(f"  Converted foil: {foil_count} (type: {type(foil_count)})")
+
+            if regular_count == 0 and foil_count == 0:
+                continue  # Skip if no inventory to add
+
+            # Match by Title and extract collector number from Option1 Value
+            # Option1 Value format: "Edge of Eternities {R} #1" - extract the number after #
+            def extract_collector_number(option1_value):
+                if pd.isna(option1_value):
+                    return None
+                import re
+                match = re.search(r'#(\d+)', str(option1_value))
+                return match.group(1) if match else None
+
+            # Find matching cards in Shopify CSV
+            matching_cards = adjusted_df[adjusted_df['Handle'] == handle]
+            
+            print(f"\nLooking for: {card_name} #{card_number}")
+            print(f"Looking for Handle: {handle}")
+            print(f"Found {len(matching_cards)} cards with handle '{handle}'")
+            print(f"Regular count: {regular_count}, Foil count: {foil_count}")
+            
+            # Check ALL variants for the correct collector number
+            found_regular = False
+            found_foil = False
+            if len(matching_cards) > 0:
+                print("Checking all variants:")
+                for idx, card in matching_cards.iterrows():
+                    option1_value = card['Option1 Value']
+                    extracted_number = extract_collector_number(option1_value)
+                    is_foil = '(Foil)' in option1_value
+                    print(f"  - Variant: Option1 Value='{option1_value}', extracted number='{extracted_number}', is_foil={is_foil}")
+                    
+                    # Check if this variant has the correct collector number
+                    if extracted_number == card_number:
+                        if is_foil:
+                            found_foil = True
+                            print(f"    ✅ Found foil variant with collector number #{card_number}")
+                        else:
+                            found_regular = True
+                            print(f"    ✅ Found regular variant with collector number #{card_number}")
+            
+            # Update regular variant
+            if regular_count > 0:
+                regular_mask = (
+                    (adjusted_df['Handle'] == handle) & 
+                    (adjusted_df['Option1 Value'].apply(extract_collector_number) == card_number) &
+                    (~adjusted_df['Option1 Value'].str.contains(r'\(Foil\)', na=False))
+                )
+                
+                if regular_mask.any():
+                    current_inventory = adjusted_df.loc[regular_mask, 'Variant Inventory Qty'].values
+                    print(f"  Regular - Current inventory values: {current_inventory}")
+                    
+                    # Add count sheet quantity to existing inventory
+                    for idx in adjusted_df[regular_mask].index:
+                        existing_qty = adjusted_df.loc[idx, 'Variant Inventory Qty']
+                        if pd.isna(existing_qty) or existing_qty == '':
+                            existing_qty = 0
+                        else:
+                            try:
+                                existing_qty = int(float(existing_qty))
+                            except (ValueError, TypeError):
+                                existing_qty = 0
+                        
+                        new_qty = existing_qty + regular_count
+                        adjusted_df.loc[idx, 'Variant Inventory Qty'] = new_qty
+                        print(f"  Regular - Added {regular_count} to existing {existing_qty} = {new_qty}")
+                        
+
+                    
+                    updated_inventory = adjusted_df.loc[regular_mask, 'Variant Inventory Qty'].values
+                    print(f"  Regular - Updated inventory values: {updated_inventory}")
+                    matches_found += 1
+                    print(f"✅ Updated regular {card_name} #{card_number} with quantity {regular_count}")
+                else:
+                    print(f"❌ No regular variant found for {card_name} #{card_number}")
+            
+            # Update or create foil variant
+            if foil_count > 0:
+                print(f"  Processing foil count: {foil_count} (type: {type(foil_count)})")
+                
+                # Debug: Show all variants for this handle
+                handle_variants = adjusted_df[adjusted_df['Handle'] == handle]
+                print(f"  All variants for handle '{handle}':")
+                for idx, variant in handle_variants.iterrows():
+                    option1_value = variant.get('Option1 Value', '')
+                    extracted_num = extract_collector_number(option1_value)
+                    is_foil = '(Foil)' in option1_value
+                    print(f"    - Variant: Option1 Value='{option1_value}', extracted number='{extracted_num}', is_foil={is_foil}")
+                    print(f"      Raw Option1 Value: '{option1_value}'")
+                    print(f"      Contains 'Foil': {'Foil' in option1_value}")
+                    print(f"      Contains '(Foil)': {'(Foil)' in option1_value}")
+                    print(f"      Contains '[Boosterfun]': {'[Boosterfun]' in option1_value}")
+                    if is_foil:
+                        print(f"      ✅ This is a foil variant!")
+                    else:
+                        print(f"      ❌ This is NOT a foil variant")
+                
+                # Simple foil detection for format: Edge of Eternities: Stellar Sights {M} #1 (Foil) [Boosterfun]
+                foil_mask = (
+                    (adjusted_df['Handle'] == handle) & 
+                    (adjusted_df['Option1 Value'].apply(extract_collector_number) == card_number) &
+                    (adjusted_df['Option1 Value'].str.contains(r'\(Foil\)', na=False))
+                )
+                
+                print(f"  Foil mask found {foil_mask.sum()} matching variants")
+                if foil_mask.any():
+                    # Update existing foil variant
+                    current_inventory = adjusted_df.loc[foil_mask, 'Variant Inventory Qty'].values
+                    print(f"  Foil - Current inventory values: {current_inventory}")
+                    
+                    # Add count sheet quantity to existing inventory
+                    for idx in adjusted_df[foil_mask].index:
+                        existing_qty = adjusted_df.loc[idx, 'Variant Inventory Qty']
+                        if pd.isna(existing_qty) or existing_qty == '':
+                            existing_qty = 0
+                        else:
+                            try:
+                                existing_qty = int(float(existing_qty))
+                            except (ValueError, TypeError):
+                                existing_qty = 0
+                        
+                        new_qty = existing_qty + foil_count
+                        adjusted_df.loc[idx, 'Variant Inventory Qty'] = new_qty
+                        print(f"  Foil - Added {foil_count} to existing {existing_qty} = {new_qty}")
+                    
+                    updated_inventory = adjusted_df.loc[foil_mask, 'Variant Inventory Qty'].values
+                    print(f"  Foil - Updated inventory values: {updated_inventory}")
+                    matches_found += 1
+                    print(f"✅ Updated foil {card_name} #{card_number} with quantity {foil_count}")
+                else:
+                    print(f"❌ No existing foil variant found for {card_name} #{card_number} - foil count {foil_count} will not be added")
+                    
+        except Exception as e:
+            print(f"Error processing row for card: {card_name if 'card_name' in locals() else 'unknown'}")
+            print(f"Error details: {str(e)}")
+            print(f"Row data: {count_row.to_dict()}")
+            continue
+
+    print(f"\nTotal matches found: {matches_found}")
+    return adjusted_df
+
 # 7. Main App Logic
 def main():
     st.set_page_config(page_title="Magic Card Tagger", layout="wide")
@@ -526,20 +747,65 @@ def main():
         </style>
     """, unsafe_allow_html=True)
 
-    # --- Sidebar with logo ---
-    # Instruct user to place logo.png in the project directory
+    # --- Homepage with logo and navigation ---
     import os
     logo_path = os.path.join(os.path.dirname(__file__), 'logo.png')
+    # Center the logo
     if os.path.exists(logo_path):
-        st.sidebar.image(logo_path, use_container_width=True)
+        st.markdown("""
+        <div style="display: flex; justify-content: center; align-items: center;">
+            <img src="data:image/png;base64,{}" width="200" style="display: block;">
+        </div>
+        """.format(base64.b64encode(open(logo_path, 'rb').read()).decode()), unsafe_allow_html=True)
     else:
-        st.sidebar.info('To display the logo, download it from [this link](https://drive.google.com/file/d/1zTe-hfoDw8s3GPTOWnyv76RFyF6mpN_c/view?usp=sharing) and save as logo.png in the app folder.')
-    st.sidebar.title("Magic Card Tagger")
-    st.sidebar.markdown("Enrich Magic card lists or download full sets for Shopify.")
-    page = st.sidebar.radio("Choose a feature:", ["Upload & Enrich Card List", "Download Set as Shopify CSV"])
+        st.markdown("""
+        <div style="display: flex; justify-content: center; align-items: center;">
+        """, unsafe_allow_html=True)
+        st.info('To display the logo, download it from [this link](https://drive.google.com/file/d/1zTe-hfoDw8s3GPTOWnyv76RFyF6mpN_c/view?usp=sharing) and save as logo.png in the app folder.')
+        st.markdown("</div>", unsafe_allow_html=True)
+    
+    # Center the title and subtitle
+    st.markdown("<h1 style='text-align: center;'>Magic Card Tagger</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center;'>Enrich Magic card lists or download full sets for Shopify.</p>", unsafe_allow_html=True)
+    
+    # Homepage with buttons
+    if 'current_page' not in st.session_state:
+        st.session_state.current_page = "Home"
+    
+    if st.session_state.current_page == "Home":
+        st.header("Choose a Feature")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("📤 Upload & Enrich Card List", use_container_width=True):
+                st.session_state.current_page = "Upload & Enrich Card List"
+                st.rerun()
+            
+            if st.button("📥 Download Set as Shopify CSV", use_container_width=True):
+                st.session_state.current_page = "Download Set as Shopify CSV"
+                st.rerun()
+        
+        with col2:
+            if st.button("📊 Top Deck Count Sheet to Shopify CSV", use_container_width=True):
+                st.session_state.current_page = "Top Deck Count Sheet to Shopify CSV with Prices"
+                st.rerun()
+            
+            if st.button("💰 Price Check & Update", use_container_width=True):
+                st.session_state.current_page = "Price Check & Update"
+                st.rerun()
+    
+    # Navigation logic
+    page = st.session_state.current_page
 
     if page == "Upload & Enrich Card List":
-        st.header("Upload & Enrich Card List")
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            if st.button("🏠 Back to Home"):
+                st.session_state.current_page = "Home"
+                st.rerun()
+        with col2:
+            st.header("Upload & Enrich Card List")
         st.markdown("""
         Upload a CSV or TXT with card names. The app will fill in the Shopify columns with Scryfall data where possible.
         """)
@@ -796,7 +1062,13 @@ def main():
                 st.download_button("Download tagged CSV", data=output.getvalue(), file_name="tagged_cards.csv", mime="text/csv")
 
     elif page == "Download Set as Shopify CSV":
-        st.header("Download Set as Shopify CSV")
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            if st.button("🏠 Back to Home"):
+                st.session_state.current_page = "Home"
+                st.rerun()
+        with col2:
+            st.header("Download Set as Shopify CSV")
         st.markdown("""
         Select a Magic set to download all regular cards as a Shopify-enriched CSV. Only regular cards (not tokens, promos, or digital-only) are included.
         """)
@@ -873,8 +1145,407 @@ def main():
         else:
             st.warning("Could not fetch Magic sets from Scryfall.")
 
-    print("STORE:", os.environ.get("SHOPIFY_STORE"))
-    print("TOKEN:", os.environ.get("SHOPIFY_ADMIN_API_ACCESS_TOKEN"))
+    elif page == "Top Deck Count Sheet to Shopify CSV with Prices":
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            if st.button("🏠 Back to Home"):
+                st.session_state.current_page = "Home"
+                st.rerun()
+        with col2:
+            st.header("Top Deck Count Sheet to Shopify CSV with Prices")
+        st.markdown("""
+        Upload a count CSV file and a Shopify CSV file to adjust inventory quantities.
+        The count sheet should contain: card_name, set_name, collector_number, inventory_quantity, and Foil inventory_quantity.
+        """)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Upload Count Sheet")
+            count_file = st.file_uploader("Choose count CSV file", type=["csv"], key="count_file")
+            
+        with col2:
+            st.subheader("Upload Shopify CSV")
+            shopify_file = st.file_uploader("Choose Shopify CSV file", type=["csv"], key="shopify_file")
+        
+        if count_file and shopify_file:
+            try:
+                count_df = pd.read_csv(count_file)
+                shopify_df = pd.read_csv(shopify_file)
+                
+                st.success(f"Loaded {len(count_df)} count records and {len(shopify_df)} Shopify records")
+                
+                # Show preview of count data
+                st.subheader("Count Sheet Preview")
+                st.dataframe(count_df[['card_name', 'set_name', 'collector_number', 'inventory_quantity', 'Foil inventory_quantity']].head(10), use_container_width=True)
+                
+                # Show preview of Shopify data
+                st.subheader("Shopify CSV Preview")
+                shopify_preview_cols = ['Handle', 'Title', 'Option1 Value', 'Variant Inventory Qty', 'Variant Price']
+                shopify_available_cols = [col for col in shopify_preview_cols if col in shopify_df.columns]
+                st.dataframe(shopify_df[shopify_available_cols].head(10), use_container_width=True)
+                
+                if st.button("Adjust Inventory Quantities"):
+                    st.info("Processing inventory adjustments...")
+                    
+                    # Add debugging info
+                    st.write(f"Count sheet columns: {list(count_df.columns)}")
+                    st.write(f"Shopify CSV columns: {list(shopify_df.columns)}")
+                    st.write(f"Sample count data:")
+                    st.write(count_df[['card_name', 'set_name', 'collector_number', 'inventory_quantity', 'Foil inventory_quantity']].head(3))
+                    st.write(f"Sample Shopify data:")
+                    st.write(shopify_df[['Title', 'Option1 Value', 'Variant Inventory Qty']].head(3))
+                    
+                    adjusted_df = adjust_shopify_csv_with_counts(count_df, shopify_df)
+                    
+                    st.success(f"Created {len(adjusted_df)} inventory records")
+                    
+                    # Show preview of adjusted data
+                    st.subheader("Adjusted Inventory Preview")
+                    preview_cols = ['Title', 'Option1 Value', 'Variant Inventory Qty', 'Variant Price']
+                    available_cols = [col for col in preview_cols if col in adjusted_df.columns]
+                    st.dataframe(adjusted_df[available_cols].head(10), use_container_width=True)
+                    
+                    # Download adjusted CSV
+                    output = io.StringIO()
+                    adjusted_df.to_csv(output, index=False)
+                    st.download_button(
+                        "Download Adjusted Shopify CSV", 
+                        data=output.getvalue(), 
+                        file_name="adjusted_shopify_inventory.csv", 
+                        mime="text/csv"
+                    )
+                    
+            except Exception as e:
+                st.error(f"Error processing files: {str(e)}")
+                st.info("Make sure your count CSV has columns: card_name, set_name, collector_number, inventory_quantity, Foil inventory_quantity")
+                st.info("Make sure your Shopify CSV has the standard Shopify product format with Title and Option1 Value columns")
+        elif count_file or shopify_file:
+            st.warning("Please upload both files to proceed")
+        else:
+            st.info("Upload both a count CSV file and a Shopify CSV file to adjust inventory quantities")
+
+    elif page == "Price Check & Update":
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            if st.button("🏠 Back to Home"):
+                st.session_state.current_page = "Home"
+                st.rerun()
+        with col2:
+            st.header("Price Check & Update")
+        st.markdown("""
+        Upload a Shopify CSV file to check and update prices based on current Scryfall data.
+        Prices will only be updated if the Scryfall price (converted to ZAR with VAT) is higher than the existing price.
+        """)
+        
+        shopify_file = st.file_uploader("Choose Shopify CSV file", type=["csv"], key="price_check_file")
+        
+        if shopify_file:
+            try:
+                shopify_df = pd.read_csv(shopify_file)
+                st.success(f"Loaded {len(shopify_df)} Shopify records")
+                
+                # Show preview of Shopify data
+                st.subheader("Shopify CSV Preview")
+                preview_cols = ['Handle', 'Title', 'Option1 Value', 'Variant Price']
+                available_cols = [col for col in preview_cols if col in shopify_df.columns]
+                st.dataframe(shopify_df[available_cols].head(10), use_container_width=True)
+                
+                if st.button("Check and Update Prices"):
+                    st.info("Checking prices against Scryfall data...")
+                    
+                    # Debug: Show available columns
+                    st.write(f"Available columns in CSV: {list(shopify_df.columns)}")
+                    
+                    # Get exchange rate
+                    usd_to_zar = get_usd_to_zar()
+                    if not usd_to_zar:
+                        st.error("Could not fetch USD to ZAR exchange rate. Price updates will be skipped.")
+                        return
+                    
+                    st.info(f"Current USD to ZAR exchange rate: 1 USD = {usd_to_zar:.2f} ZAR")
+                    
+                    # Process price updates
+                    updated_df = shopify_df.copy()
+                    price_updates = 0
+                    price_checks = 0
+                    price_changes = []  # Store all price change information
+                    
+                    # Debug: Show total number of rows and unique handles
+                    st.write(f"Total rows in CSV: {len(updated_df)}")
+                    st.write(f"Unique handles found: {updated_df['Handle'].nunique()}")
+                    st.write(f"Sample handles: {updated_df['Handle'].head(5).tolist()}")
+                    
+                    # Group by Handle to process each product
+                    total_products = len(updated_df.groupby('Handle'))
+                    processed = 0
+                    
+                    for handle, group in updated_df.groupby('Handle'):
+                        processed += 1
+                        # Get the first row to extract card name
+                        first_row = group.iloc[0]
+                        card_name = first_row.get('Title', '')
+                        
+                        st.write(f"Processing {processed}/{total_products}: '{handle}' with card_name: '{card_name}'")
+                        st.write(f"  Raw Title value: {repr(first_row.get('Title', ''))}")
+                        st.write(f"  Title type: {type(first_row.get('Title', ''))}")
+                        
+                        # Try to extract card name from Option1 Value if Title is NaN
+                        if not card_name or pd.isna(card_name):
+                            option1_value = first_row.get('Option1 Value', '')
+                            st.write(f"  Trying Option1 Value: {option1_value}")
+                            
+                            # Extract card name from Option1 Value (e.g., "Edge of Eternities: Stellar Sights {M} #1 (Foil) [Boosterfun]" -> "Edge of Eternities: Stellar Sights")
+                            if option1_value and not pd.isna(option1_value):
+                                # Remove the set code and collector number
+                                import re
+                                # Remove everything after the first { or [
+                                card_name = re.sub(r'\{.*?\}.*$', '', option1_value).strip()
+                                card_name = re.sub(r'\[.*?\]', '', card_name).strip()
+                                st.write(f"  Extracted card name: '{card_name}'")
+                                
+                                # The issue is we're getting the set name, not the card name
+                                # We need to extract the actual card name from the handle
+                                # Handle format: "ancient-tomb", "blast-zone", etc.
+                                # Convert handle back to card name
+                                card_name_from_handle = handle.replace('-', ' ').title()
+                                st.write(f"  Card name from handle: '{card_name_from_handle}'")
+                                card_name = card_name_from_handle
+                                
+                                # Debug: Show the exact card name being used for Scryfall
+                                st.write(f"  Final card name for Scryfall: '{card_name}'")
+                        
+                        if not card_name or pd.isna(card_name):
+                            st.write(f"  ⚠️ Skipping - no valid card name")
+                            continue
+                        
+                        price_checks += 1
+                        st.write(f"Processing product: {card_name} (Handle: {handle}) - {len(group)} variants")
+                        
+                        # Check each variant of this product
+                        for idx, row in group.iterrows():
+                            option1_value = row.get('Option1 Value', '')
+                            
+                            # Check if Variant Price column exists, otherwise use 0
+                            if 'Variant Price' in row:
+                                current_price = row.get('Variant Price', '')
+                            else:
+                                current_price = ''
+                                st.write(f"  ⚠️ No 'Variant Price' column found in CSV")
+                            
+                            # Determine if this is a foil variant
+                            is_foil = '(Foil)' in option1_value if option1_value else False
+                            
+                            st.write(f"  Checking variant: {option1_value} (Foil: {is_foil}) - Current price: {current_price}")
+                            
+                            # Convert current price to float
+                            if pd.notna(current_price) and current_price != '':
+                                try:
+                                    current_price_float = float(current_price)
+                                except (ValueError, TypeError):
+                                    current_price_float = 0
+                            else:
+                                current_price_float = 0
+                            
+                            # Get Scryfall price with better error handling
+                            st.write(f"    Calling Scryfall for: '{card_name}' (Foil: {is_foil})")
+                            
+                            # Add rate limiting to avoid API issues
+                            import time
+                            time.sleep(0.1)  # 100ms delay between calls
+                            
+                            try:
+                                # Try to get the specific set version first
+                                set_code = None
+                                if option1_value and not pd.isna(option1_value):
+                                    # Use the correct set code for Edge of Eternities: Stellar Sights
+                                    set_code = "eos"
+                                    st.write(f"    Trying with set code: '{set_code}'")
+                                    scryfall_data = fetch_card_info(card_name, set_code, is_foil)
+                                    
+                                    # If that fails, try without set
+                                    if not scryfall_data or not scryfall_data.get('usd_price'):
+                                        st.write(f"    Set-specific search failed, trying generic search")
+                                        scryfall_data = fetch_card_info(card_name, None, is_foil)
+                                else:
+                                    scryfall_data = fetch_card_info(card_name, None, is_foil)
+                                
+                                st.write(f"    Scryfall response: {scryfall_data}")
+                                
+                                # Debug: Check if we got any data
+                                if scryfall_data:
+                                    st.write(f"    Has usd_price: {'usd_price' in scryfall_data}")
+                                    if 'usd_price' in scryfall_data:
+                                        st.write(f"    USD price: {scryfall_data['usd_price']}")
+                                    
+                                    # Show all available price data
+                                    if 'prices' in scryfall_data:
+                                        st.write(f"    All prices: {scryfall_data['prices']}")
+                                    else:
+                                        st.write(f"    No prices object found")
+                                else:
+                                    st.write(f"    No Scryfall data returned")
+                                    
+                            except Exception as e:
+                                st.write(f"    Scryfall API error: {str(e)}")
+                                scryfall_data = None
+                            
+                            if scryfall_data and 'usd_price' in scryfall_data and scryfall_data['usd_price']:
+                                try:
+                                    scryfall_usd = float(scryfall_data['usd_price'])
+                                    scryfall_zar_calculated = calculate_price_with_vat(scryfall_usd, usd_to_zar)
+                                    
+                                    if scryfall_zar_calculated and scryfall_zar_calculated != '':
+                                        scryfall_zar = float(scryfall_zar_calculated)
+                                        if scryfall_zar > current_price_float:
+                                            updated_df.loc[idx, 'Variant Price'] = scryfall_zar_calculated
+                                            price_updates += 1
+                                            price_changes.append({
+                                                'Card Name': card_name,
+                                                'Variant': 'Foil' if is_foil else 'Regular',
+                                                'Original Price': f"R{current_price_float:.2f}",
+                                                'New Price': f"R{scryfall_zar:.2f}",
+                                                'Scryfall ZAR': f"R{scryfall_zar:.2f}",
+                                                'Status': 'Updated'
+                                            })
+                                        else:
+                                            price_changes.append({
+                                                'Card Name': card_name,
+                                                'Variant': 'Foil' if is_foil else 'Regular',
+                                                'Original Price': f"R{current_price_float:.2f}",
+                                                'New Price': f"R{current_price_float:.2f}",
+                                                'Scryfall ZAR': f"R{scryfall_zar:.2f}",
+                                                'Status': 'No Change'
+                                            })
+                                    else:
+                                        price_changes.append({
+                                            'Card Name': card_name,
+                                            'Variant': 'Foil' if is_foil else 'Regular',
+                                            'Original Price': f"R{current_price_float:.2f}",
+                                            'New Price': f"R{current_price_float:.2f}",
+                                            'Scryfall ZAR': 'N/A',
+                                            'Status': 'No Valid Price'
+                                        })
+                                except (ValueError, TypeError):
+                                    price_changes.append({
+                                        'Card Name': card_name,
+                                        'Variant': 'Foil' if is_foil else 'Regular',
+                                        'Original Price': f"R{current_price_float:.2f}",
+                                        'New Price': f"R{current_price_float:.2f}",
+                                        'Scryfall ZAR': 'Error',
+                                        'Status': 'Error'
+                                    })
+                            else:
+                                price_changes.append({
+                                    'Card Name': card_name,
+                                    'Variant': 'Foil' if is_foil else 'Regular',
+                                    'Original Price': f"R{current_price_float:.2f}",
+                                    'New Price': f"R{current_price_float:.2f}",
+                                    'Scryfall ZAR': 'Not Found',
+                                    'Status': 'No Scryfall Data'
+                                })
+                    
+                    st.success(f"Price check complete! Checked {price_checks} products, updated {price_updates} prices.")
+                    
+                    # Play completion sound
+                    st.audio("https://www.soundjay.com/misc/sounds/bell-ringing-05.wav", format="audio/wav")
+                    
+                    st.info(f"Results summary: {len(price_changes)} total variants processed")
+                    
+                    # Display comprehensive price change list
+                    if price_changes:
+                        st.subheader("Price Change Summary")
+                        
+                        # Create DataFrame for better display
+                        price_df = pd.DataFrame(price_changes)
+                        
+                        # Show summary statistics
+                        updated_count = len(price_df[price_df['Status'] == 'Updated'])
+                        no_change_count = len(price_df[price_df['Status'] == 'No Change'])
+                        error_count = len(price_df[price_df['Status'].isin(['Error', 'No Valid Price', 'No Scryfall Data'])])
+                        
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Updated", updated_count)
+                        with col2:
+                            st.metric("No Change", no_change_count)
+                        with col3:
+                            st.metric("Errors/Issues", error_count)
+                        
+                        # Show detailed error breakdown
+                        if error_count > 0:
+                            st.subheader("Error Breakdown")
+                            error_df = price_df[price_df['Status'].isin(['Error', 'No Valid Price', 'No Scryfall Data'])]
+                            error_summary = error_df['Status'].value_counts()
+                            st.write("Error types found:")
+                            for error_type, count in error_summary.items():
+                                st.write(f"- {error_type}: {count}")
+                            
+                            # Show first few error examples
+                            st.write("Sample errors:")
+                            st.dataframe(error_df[['Card Name', 'Variant', 'Status']].head(10), use_container_width=True)
+                        
+                        # Show detailed price change table
+                        st.subheader("Detailed Price Changes")
+                        
+                        # Add filter options
+                        status_filter = st.selectbox(
+                            "Filter by status:",
+                            ["All", "Updated", "No Change", "Error", "No Valid Price", "No Scryfall Data"]
+                        )
+                        
+                        if status_filter == "All":
+                            filtered_df = price_df
+                        else:
+                            filtered_df = price_df[price_df['Status'] == status_filter]
+                        
+                        st.write(f"Showing {len(filtered_df)} results for '{status_filter}'")
+                        st.dataframe(filtered_df, use_container_width=True)
+                        
+                        # Download price change report
+                        price_report = io.StringIO()
+                        price_df.to_csv(price_report, index=False)
+                        st.download_button(
+                            "Download Price Change Report",
+                            data=price_report.getvalue(),
+                            file_name="price_change_report.csv",
+                            mime="text/csv"
+                        )
+                    
+                    # Add a column to show which rows were updated
+                    updated_df['Price Updated'] = 'No'
+                    for change in price_changes:
+                        if change['Status'] == 'Updated':
+                            # Find matching rows and mark them as updated
+                            mask = (
+                                (updated_df['Handle'] == change['Card Name'].lower().replace(' ', '-')) &
+                                (updated_df['Option1 Value'].str.contains('(Foil)', na=False) == ('Foil' in change['Variant']))
+                            )
+                            updated_df.loc[mask, 'Price Updated'] = 'Yes'
+                    
+                    # Show preview of updated data
+                    st.subheader("Updated Prices Preview")
+                    preview_cols = ['Handle', 'Title', 'Option1 Value', 'Variant Price', 'Price Updated']
+                    available_cols = [col for col in preview_cols if col in updated_df.columns]
+                    st.dataframe(updated_df[available_cols].head(10), use_container_width=True)
+                    
+                    # Download updated CSV
+                    output = io.StringIO()
+                    updated_df.to_csv(output, index=False)
+                    st.download_button(
+                        "Download Updated Shopify CSV", 
+                        data=output.getvalue(), 
+                        file_name="updated_shopify_prices.csv", 
+                        mime="text/csv"
+                    )
+                    
+            except Exception as e:
+                st.error(f"Error processing file: {str(e)}")
+                st.info("Make sure your Shopify CSV has the standard Shopify product format")
+        else:
+            st.info("Upload a Shopify CSV file to check and update prices")
+
+
 
 if __name__ == "__main__":
     import sys
