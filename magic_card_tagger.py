@@ -765,8 +765,8 @@ def main():
         st.markdown("</div>", unsafe_allow_html=True)
     
     # Center the title and subtitle
-    st.markdown("<h1 style='text-align: center;'>Magic Card Tagger</h1>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align: center;'>Enrich Magic card lists or download full sets for Shopify.</p>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>Card Inventory Manager</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center;'>Count converter, price updater and more.</p>", unsafe_allow_html=True)
     
     # Homepage with buttons
     if 'current_page' not in st.session_state:
