@@ -16,6 +16,7 @@ import base64
 from dotenv import load_dotenv
 import json
 import time
+from bs4 import BeautifulSoup
 
 # Use python-dotenv to load .env file
 load_dotenv(dotenv_path="C:/Users/frogm/github_repos/magic-card-tagger-1/.env")
@@ -98,15 +99,15 @@ def calculate_price_with_vat(usd_price, usd_to_zar):
         return ''
     try:
         price_zar = float(usd_price) * usd_to_zar * 1.15  # Add 15% VAT
+        # Apply price floors
         if price_zar < 5:
-            return '5'
+            price_zar = 5
         elif price_zar < 8:
-            return '8'
+            price_zar = 8
         elif price_zar < 10:
-            return '10'
-        else:
-            return str(int(math.ceil(price_zar)))
-    except Exception:
+            price_zar = 10
+        return f"{price_zar:.2f}"
+    except (ValueError, TypeError):
         return ''
 
 def fetch_scryfall_sets():
@@ -271,7 +272,7 @@ def get_shopify_base_url():
     return f"https://{store}/admin/api/2023-10"
 
 def get_location_id():
-    """Retrieves and caches the Shopify store’s location ID for inventory management."""
+    """Retrieves and caches the Shopify store's location ID for inventory management."""
     # Cache location_id after first fetch
     if not hasattr(get_location_id, 'location_id'):
         base_url = get_shopify_base_url()
@@ -289,7 +290,7 @@ def get_location_id():
     return get_location_id.location_id
 
 def set_inventory_level(inventory_item_id, available):
-    """Sets the inventory level for a variant at the store’s location using the InventoryLevel API."""
+    """Sets the inventory level for a variant at the store's location using the InventoryLevel API."""
     location_id = get_location_id()
     if not location_id:
         st.warning('Could not fetch Shopify location_id, inventory not updated.')
@@ -445,7 +446,7 @@ def get_product_variants_by_handle(handle):
     return None, None
 
 def update_shopify_variant(product_id, variant_id, price, quantity):
-    """Updates a variant’s price in Shopify, and sets inventory using the InventoryLevel API. Sends a full variant payload."""
+    """Updates a variant's price in Shopify, and sets inventory using the InventoryLevel API. Sends a full variant payload."""
     base_url = get_shopify_base_url()
     headers = get_shopify_auth_headers()
     if not base_url or not headers:
@@ -736,6 +737,474 @@ def adjust_shopify_csv_with_counts(count_df, shopify_df):
     print(f"\nTotal matches found: {matches_found}")
     return adjusted_df
 
+# Deckbox Collection Value Calculator Functions
+USD_TO_ZAR = 18  # Conversion rate
+STORE_OFFER_PERCENT = 0.4
+STORE_CREDIT_PERCENT = 0.5
+
+def debug_show_html(html, tables, rows):
+    with st.expander("Debug: Raw HTML and Table Info"):
+        st.write(f"Found {len(tables)} tables on the page.")
+        if tables:
+            st.code(str(tables[0])[:2000], language='html')
+        st.write(f"First 3 rows:")
+        for row in rows[:3]:
+            st.write([c.get_text(strip=True) for c in row.find_all('td')])
+
+@st.cache_data(show_spinner=False)
+def get_total_pages(url):
+    try:
+        resp = requests.get(url)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        page_info = soup.find(string=re.compile(r'Page \\d+ of \\d+'))
+        if page_info:
+            match = re.search(r'Page \d+ of (\d+)', page_info)
+            if match:
+                return int(match.group(1))
+        last_page = 1
+        for a in soup.find_all('a', href=True):
+            if '?p=' in a['href']:
+                try:
+                    page_num = int(a['href'].split('=')[-1])
+                    if page_num > last_page:
+                        last_page = page_num
+                except Exception:
+                    continue
+        return last_page
+    except Exception as e:
+        return 1
+
+@st.cache_data(show_spinner=False)
+def scrape_deckbox_page(url, debug=False):
+    resp = requests.get(url)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, 'html.parser')
+    tables = soup.find_all('table')
+    table = None
+    for t in tables:
+        headers = t.find_all('th')
+        if len(headers) >= 5:
+            table = t
+            break
+    data = []
+    if not table:
+        if debug:
+            debug_show_html(soup.prettify(), tables, [])
+        return data
+    rows = table.find_all('tr')[1:]
+    if debug:
+        debug_show_html(soup.prettify(), tables, rows)
+    for row in rows:
+        cols = row.find_all('td')
+        if len(cols) < 5:
+            continue
+        qty = cols[0].get_text(strip=True)
+        name = cols[1].get_text(strip=True)
+        price_text = cols[3].get_text(strip=True)
+        price_match = re.search(r'\$(\d+\.\d+)', price_text)
+        price = float(price_match.group(1)) if price_match else 0.0
+        try:
+            qty = int(qty)
+        except Exception:
+            qty = 1
+        data.append({
+            'Name': name,
+            'Quantity': qty,
+            'Price': price,
+            'Total': qty * price
+        })
+    return data
+
+def scrape_entire_collection(base_url):
+    base_url = re.sub(r'\?p=\d+$', '', base_url)
+    total_pages = get_total_pages(base_url)
+    all_cards = []
+    progress = st.progress(0, text="Scraping Deckbox pages...")
+    for page in range(1, total_pages + 1):
+        if page == 1:
+            page_url = base_url
+        else:
+            page_url = f"{base_url}?p={page}"
+        try:
+            cards = scrape_deckbox_page(page_url, debug=(page==1))
+            all_cards.extend(cards)
+        except Exception as e:
+            st.warning(f"Failed to scrape page {page}: {e}")
+        progress.progress(page / total_pages, text=f"Scraping page {page} of {total_pages}")
+        time.sleep(0.2)
+    progress.empty()
+    return all_cards
+
+def aggregate_cards(cards):
+    df = pd.DataFrame(cards)
+    if df.empty:
+        return df, 0.0
+    grouped = df.groupby(['Name', 'Price'], as_index=False).agg({'Quantity': 'sum', 'Total': 'sum'})
+    total_value = grouped['Total'].sum()
+    grouped = grouped.sort_values(by='Total', ascending=False)
+    return grouped, total_value
+
+# Moxfield Deck Value Calculator Functions
+def extract_moxfield_deck_id(url):
+    """Extracts the deck ID from a Moxfield URL."""
+    import re
+    # Handle various Moxfield URL formats
+    patterns = [
+        r'moxfield\.com/decks/([a-zA-Z0-9_-]+)',
+        r'moxfield\.com/deck/([a-zA-Z0-9_-]+)',
+        r'decks/([a-zA-Z0-9_-]+)',
+        r'deck/([a-zA-Z0-9_-]+)'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+def fetch_moxfield_deck(deck_id):
+    """Fetches deck data from Moxfield API."""
+    try:
+        # Try the correct API endpoint with more realistic headers
+        url = f"https://api.moxfield.com/v2/decks/all/{deck_id}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Referer': 'https://www.moxfield.com/',
+            'Origin': 'https://www.moxfield.com',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-site',
+            'Connection': 'keep-alive',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache'
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except Exception as e:
+        # If the API fails, try web scraping as fallback
+        try:
+            st.info("API access failed, trying web scraping...")
+            return scrape_moxfield_deck_web(deck_id)
+        except Exception as scrape_error:
+            st.error(f"Error fetching Moxfield deck: {e}")
+            st.error(f"Web scraping also failed: {scrape_error}")
+            return None
+
+def scrape_moxfield_deck_web(deck_id):
+    """Scrapes deck data from Moxfield web page as fallback."""
+    try:
+        url = f"https://www.moxfield.com/decks/{deck_id}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Referer': 'https://www.moxfield.com/',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'same-origin',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Cache-Control': 'max-age=0'
+        }
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Look for the deck data in the page's JavaScript
+        scripts = soup.find_all('script')
+        deck_data = None
+        
+        for script in scripts:
+            if script.string and 'window.__INITIAL_STATE__' in script.string:
+                # Extract the deck data from the JavaScript
+                import re
+                import json
+                
+                # Find the INITIAL_STATE__ object
+                match = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.*?});', script.string, re.DOTALL)
+                if match:
+                    try:
+                        initial_state = json.loads(match.group(1))
+                        # Navigate to the deck data
+                        if 'decks' in initial_state and deck_id in initial_state['decks']:
+                            deck_data = initial_state['decks'][deck_id]
+                            break
+                    except json.JSONDecodeError:
+                        continue
+        
+        if not deck_data:
+            # Fallback: try to extract from a different script pattern
+            for script in scripts:
+                if script.string and 'deck' in script.string.lower():
+                    # Look for deck data in other script tags
+                    try:
+                        # Try to find deck data in various formats
+                        if '"mainboard"' in script.string and '"sideboard"' in script.string:
+                            # Extract the deck object
+                            deck_match = re.search(r'({[^}]*"mainboard"[^}]*})', script.string)
+                            if deck_match:
+                                deck_data = json.loads(deck_match.group(1))
+                                break
+                    except:
+                        continue
+        
+        return deck_data
+        
+    except Exception as e:
+        # If JavaScript extraction fails, try direct HTML parsing
+        try:
+            st.info("JavaScript extraction failed, trying direct HTML parsing...")
+            return scrape_moxfield_deck_html(deck_id)
+        except Exception as html_error:
+            raise Exception(f"Web scraping failed: {e}. HTML parsing also failed: {html_error}")
+
+def scrape_moxfield_deck_html(deck_id):
+    """Scrapes deck data directly from HTML as final fallback."""
+    try:
+        url = f"https://www.moxfield.com/decks/{deck_id}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Referer': 'https://www.moxfield.com/',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'same-origin',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Cache-Control': 'max-age=0'
+        }
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Look for card elements in the HTML
+        cards = []
+        
+        # Try to find card elements by common selectors
+        card_selectors = [
+            '[data-testid="card-name"]',
+            '.card-name',
+            '.card-title',
+            '[class*="card"]',
+            '[class*="Card"]'
+        ]
+        
+        for selector in card_selectors:
+            card_elements = soup.select(selector)
+            if card_elements:
+                for element in card_elements:
+                    card_name = element.get_text(strip=True)
+                    if card_name and len(card_name) > 2:  # Basic validation
+                        cards.append({
+                            'Name': card_name,
+                            'Quantity': 1,
+                            'Section': 'Mainboard'
+                        })
+                break
+        
+        # If no cards found with selectors, try to extract from text
+        if not cards:
+            # Look for patterns like "2x Card Name" or "Card Name (2)"
+            import re
+            text_content = soup.get_text()
+            card_patterns = [
+                r'(\d+)x\s+([^\n\r]+)',  # 2x Card Name
+                r'([^\n\r]+)\s+\((\d+)\)',  # Card Name (2)
+                r'(\d+)\s+([^\n\r]+)',  # 2 Card Name
+            ]
+            
+            for pattern in card_patterns:
+                matches = re.findall(pattern, text_content)
+                for match in matches:
+                    if len(match) == 2:
+                        quantity = int(match[0])
+                        card_name = match[1].strip()
+                        if card_name and len(card_name) > 2:
+                            cards.append({
+                                'Name': card_name,
+                                'Quantity': quantity,
+                                'Section': 'Mainboard'
+                            })
+        
+        # Create a mock deck data structure
+        deck_data = {
+            'name': f'Deck {deck_id}',
+            'mainboard': {},
+            'sideboard': {},
+            'commanders': {}
+        }
+        
+        # Add cards to mainboard
+        for i, card in enumerate(cards):
+            deck_data['mainboard'][f'card_{i}'] = {
+                'card': {'name': card['Name']},
+                'quantity': card['Quantity']
+            }
+        
+        return deck_data
+        
+    except Exception as e:
+        raise Exception(f"HTML parsing failed: {e}")
+
+def parse_moxfield_deck(deck_data):
+    """Parses Moxfield deck data and extracts card information."""
+    cards = []
+    
+    try:
+        # Handle different data structures from API vs web scraping
+        if isinstance(deck_data, dict):
+            # Extract cards from different sections
+            mainboard = deck_data.get('mainboard', {})
+            sideboard = deck_data.get('sideboard', {})
+            commanders = deck_data.get('commanders', {})
+            
+            # Process mainboard
+            if isinstance(mainboard, dict):
+                for card_id, card_info in mainboard.items():
+                    if isinstance(card_info, dict):
+                        card_name = card_info.get('card', {}).get('name', 'Unknown Card')
+                        quantity = card_info.get('quantity', 1)
+                        cards.append({
+                            'Name': card_name,
+                            'Quantity': quantity,
+                            'Section': 'Mainboard'
+                        })
+            
+            # Process sideboard
+            if isinstance(sideboard, dict):
+                for card_id, card_info in sideboard.items():
+                    if isinstance(card_info, dict):
+                        card_name = card_info.get('card', {}).get('name', 'Unknown Card')
+                        quantity = card_info.get('quantity', 1)
+                        cards.append({
+                            'Name': card_name,
+                            'Quantity': quantity,
+                            'Section': 'Sideboard'
+                        })
+            
+            # Process commanders
+            if isinstance(commanders, dict):
+                for card_id, card_info in commanders.items():
+                    if isinstance(card_info, dict):
+                        card_name = card_info.get('card', {}).get('name', 'Unknown Card')
+                        quantity = card_info.get('quantity', 1)
+                        cards.append({
+                            'Name': card_name,
+                            'Quantity': quantity,
+                            'Section': 'Commander'
+                        })
+        
+        # If no cards found, try alternative parsing
+        if not cards:
+            st.warning("Could not parse deck data in expected format. Trying alternative parsing...")
+            # Try to extract cards from any available data
+            for key, value in deck_data.items():
+                if isinstance(value, dict) and 'cards' in str(value).lower():
+                    # Look for card data in any structure
+                    for sub_key, sub_value in value.items():
+                        if isinstance(sub_value, dict) and 'name' in sub_value:
+                            card_name = sub_value.get('name', 'Unknown Card')
+                            quantity = sub_value.get('quantity', 1)
+                            cards.append({
+                                'Name': card_name,
+                                'Quantity': quantity,
+                                'Section': 'Mainboard'
+                            })
+            
+    except Exception as e:
+        st.error(f"Error parsing Moxfield deck data: {e}")
+        st.write("Debug - Deck data structure:", deck_data)
+        return []
+    
+    return cards
+
+def get_card_prices_from_scryfall(cards):
+    """Fetches prices for cards from Scryfall API."""
+    priced_cards = []
+    
+    for card in cards:
+        card_name = card['Name']
+        quantity = card['Quantity']
+        
+        try:
+            # Fetch card info from Scryfall
+            card_info = fetch_card_info(card_name)
+            if card_info and 'usd_price' in card_info:
+                price = float(card_info['usd_price']) if card_info['usd_price'] else 0.0
+            else:
+                price = 0.0
+            
+            priced_cards.append({
+                'Name': card_name,
+                'Quantity': quantity,
+                'Price': price,
+                'Total': quantity * price,
+                'Section': card.get('Section', 'Mainboard')
+            })
+            
+            # Rate limiting
+            time.sleep(0.1)
+            
+        except Exception as e:
+            st.warning(f"Could not fetch price for {card_name}: {e}")
+            priced_cards.append({
+                'Name': card_name,
+                'Quantity': quantity,
+                'Price': 0.0,
+                'Total': 0.0,
+                'Section': card.get('Section', 'Mainboard')
+            })
+    
+    return priced_cards
+
+def parse_manual_deck_list(deck_text):
+    """Parses manually entered deck list text."""
+    cards = []
+    lines = deck_text.strip().split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        # Try different patterns
+        patterns = [
+            r'(\d+)x\s+(.+)',  # 2x Lightning Bolt
+            r'(.+)\s+\((\d+)\)',  # Lightning Bolt (2)
+            r'(\d+)\s+(.+)',  # 2 Lightning Bolt
+            r'(.+)',  # Just card name (quantity = 1)
+        ]
+        
+        for pattern in patterns:
+            match = re.match(pattern, line)
+            if match:
+                if len(match.groups()) == 2:
+                    quantity = int(match.group(1))
+                    card_name = match.group(2).strip()
+                else:
+                    quantity = 1
+                    card_name = match.group(1).strip()
+                
+                if card_name and len(card_name) > 2:
+                    cards.append({
+                        'Name': card_name,
+                        'Quantity': quantity,
+                        'Section': 'Mainboard'
+                    })
+                break
+    
+    return cards
+
 # 7. Main App Logic
 def main():
     st.set_page_config(page_title="Magic Card Tagger", layout="wide")
@@ -784,6 +1253,10 @@ def main():
             
             if st.button("📥 Download Set as Shopify CSV", use_container_width=True):
                 st.session_state.current_page = "Download Set as Shopify CSV"
+                st.rerun()
+            
+            if st.button("🎴 Deckbox Collection Value Calculator", use_container_width=True):
+                st.session_state.current_page = "Deckbox Collection Value Calculator"
                 st.rerun()
         
         with col2:
@@ -1544,6 +2017,220 @@ def main():
                 st.info("Make sure your Shopify CSV has the standard Shopify product format")
         else:
             st.info("Upload a Shopify CSV file to check and update prices")
+
+    elif page == "Deckbox Collection Value Calculator":
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            if st.button("🏠 Back to Home"):
+                st.session_state.current_page = "Home"
+                st.rerun()
+        with col2:
+            st.header("🎴 Collection Value Calculator")
+        
+        st.write("Calculate the value of your Magic: The Gathering collections and decks. Supports both Deckbox collections and Moxfield decks.")
+        
+        # Platform selection
+        platform = st.radio("Select platform:", ["Deckbox Collection", "Moxfield Deck"])
+        
+        if platform == "Deckbox Collection":
+            st.subheader("📚 Deckbox Collection")
+            st.write("The app scrapes the entire collection. It shows the total value, the value of cards above 2, the value in rand, and the store offer.")
+            
+            url = st.text_input("Enter your Deckbox collection URL:")
+            
+            if url:
+                with st.spinner("Scraping your entire Deckbox collection..."):
+                    try:
+                        cards = scrape_entire_collection(url)
+                        df_all, total_value_all = aggregate_cards(cards)
+                        # Filter for cards $2+
+                        cards_2plus = [c for c in cards if c['Price'] >= 2.0]
+                        df_2plus, total_value_2plus = aggregate_cards(cards_2plus)
+                        # Rand values
+                        total_value_all_rand = total_value_all * USD_TO_ZAR
+                        total_value_2plus_rand = total_value_2plus * USD_TO_ZAR
+                        store_offer_usd = total_value_2plus * STORE_OFFER_PERCENT
+                        store_offer_rand = store_offer_usd * USD_TO_ZAR
+                        store_credit_usd = total_value_2plus * STORE_CREDIT_PERCENT
+                        store_credit_rand = store_credit_usd * USD_TO_ZAR
+                        
+                        st.header(":moneybag: Collection Summary")
+                        st.write(f"Total collection worth: {total_value_all:,.2f}  |  R{total_value_all_rand:,.2f}")
+                        st.write(f"Cards 2 and up worth: {total_value_2plus:,.2f}  |  R{total_value_2plus_rand:,.2f}")
+                        st.write(f"Store offer (forty percent of 2 and up): {store_offer_usd:,.2f}  |  R{store_offer_rand:,.2f}")
+                        st.write(f"Store credit (fifty percent of 2 and up): {store_credit_usd:,.2f}  |  R{store_credit_rand:,.2f}")
+                        st.write("---")
+                        
+                        st.subheader("All Cards")
+                        if not df_all.empty:
+                            st.dataframe(df_all, use_container_width=True)
+                        else:
+                            st.warning("No cards found. Please check your collection URL.")
+                        
+                        st.subheader("Cards 2 and Up (Store Offer Table)")
+                        if not df_2plus.empty:
+                            st.dataframe(df_2plus, use_container_width=True)
+                        else:
+                            st.warning("No cards 2 or greater found.")
+                            
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+        
+        elif platform == "Moxfield Deck":
+            st.subheader("🎴 Moxfield Deck")
+            st.write("Enter a Moxfield deck URL to calculate its value. The app will fetch deck data and get current prices from Scryfall.")
+            
+            # Add tabs for different input methods
+            moxfield_tab1, moxfield_tab2 = st.tabs(["🔗 URL Input", "📝 Manual Input"])
+            
+            with moxfield_tab1:
+                moxfield_url = st.text_input("Enter your Moxfield deck URL:")
+                
+                if moxfield_url:
+                    # Extract deck ID from URL
+                    deck_id = extract_moxfield_deck_id(moxfield_url)
+                    
+                    if not deck_id:
+                        st.error("Could not extract deck ID from URL. Please check the URL format.")
+                    else:
+                        with st.spinner("Fetching deck data from Moxfield..."):
+                            try:
+                                # Fetch deck data
+                                deck_data = fetch_moxfield_deck(deck_id)
+                                
+                                if deck_data:
+                                    st.success(f"Successfully fetched deck: {deck_data.get('name', 'Unknown Deck')}")
+                                    
+                                    # Parse deck data
+                                    cards = parse_moxfield_deck(deck_data)
+                                    
+                                    if cards:
+                                        st.info(f"Found {len(cards)} cards in deck")
+                                        
+                                        # Get prices from Scryfall
+                                        with st.spinner("Fetching current prices from Scryfall..."):
+                                            priced_cards = get_card_prices_from_scryfall(cards)
+                                            
+                                            if priced_cards:
+                                                # Create DataFrame
+                                                df_all = pd.DataFrame(priced_cards)
+                                                total_value_all = df_all['Total'].sum()
+                                                
+                                                # Filter for cards $2+
+                                                cards_2plus = [c for c in priced_cards if c['Price'] >= 2.0]
+                                                df_2plus = pd.DataFrame(cards_2plus) if cards_2plus else pd.DataFrame()
+                                                total_value_2plus = df_2plus['Total'].sum() if not df_2plus.empty else 0.0
+                                                
+                                                # Rand values
+                                                total_value_all_rand = total_value_all * USD_TO_ZAR
+                                                total_value_2plus_rand = total_value_2plus * USD_TO_ZAR
+                                                store_offer_usd = total_value_2plus * STORE_OFFER_PERCENT
+                                                store_offer_rand = store_offer_usd * USD_TO_ZAR
+                                                store_credit_usd = total_value_2plus * STORE_CREDIT_PERCENT
+                                                store_credit_rand = store_credit_usd * USD_TO_ZAR
+                                                
+                                                st.header(":moneybag: Deck Summary")
+                                                st.write(f"Total deck worth: {total_value_all:,.2f}  |  R{total_value_all_rand:,.2f}")
+                                                st.write(f"Cards 2 and up worth: {total_value_2plus:,.2f}  |  R{total_value_2plus_rand:,.2f}")
+                                                st.write(f"Store offer (forty percent of 2 and up): {store_offer_usd:,.2f}  |  R{store_offer_rand:,.2f}")
+                                                st.write(f"Store credit (fifty percent of 2 and up): {store_credit_usd:,.2f}  |  R{store_credit_rand:,.2f}")
+                                                st.write("---")
+                                                
+                                                # Show cards by section
+                                                st.subheader("All Cards by Section")
+                                                if not df_all.empty:
+                                                    st.dataframe(df_all, use_container_width=True)
+                                                else:
+                                                    st.warning("No cards found in deck.")
+                                                
+                                                st.subheader("Cards 2 and Up (Store Offer Table)")
+                                                if not df_2plus.empty:
+                                                    st.dataframe(df_2plus, use_container_width=True)
+                                                else:
+                                                    st.warning("No cards 2 or greater found.")
+                                                    
+                                            else:
+                                                st.error("Could not fetch prices for cards.")
+                                    else:
+                                        st.warning("No cards found in deck.")
+                                else:
+                                    st.error("Could not fetch deck data from Moxfield.")
+                                    st.info("💡 Try the Manual Input tab if URL access fails.")
+                                    
+                            except Exception as e:
+                                st.error(f"Error processing Moxfield deck: {e}")
+                                st.info("💡 Try the Manual Input tab if URL access fails.")
+            
+            with moxfield_tab2:
+                st.write("If URL access fails, you can manually enter your deck list.")
+                st.write("**💡 How to get your deck list from Moxfield:**")
+                st.write("1. In Moxfield, click the **3 dots** (⋮) next to your deck")
+                st.write("2. Click **Export** to get the deck list")
+                st.write("3. Copy and paste the deck list below")
+                st.write("")
+                st.write("**Format:** One card per line, with quantity (e.g., '2x Lightning Bolt' or 'Lightning Bolt (2)')")
+                
+                manual_deck_text = st.text_area("Enter your deck list:", height=200, 
+                                               placeholder="2x Lightning Bolt\n1x Black Lotus\n3x Counterspell\n...")
+                
+                if manual_deck_text:
+                    with st.spinner("Processing manual deck list..."):
+                        try:
+                            # Parse manual deck text
+                            cards = parse_manual_deck_list(manual_deck_text)
+                            
+                            if cards:
+                                st.info(f"Found {len(cards)} cards in deck")
+                                
+                                # Get prices from Scryfall
+                                with st.spinner("Fetching current prices from Scryfall..."):
+                                    priced_cards = get_card_prices_from_scryfall(cards)
+                                    
+                                    if priced_cards:
+                                        # Create DataFrame
+                                        df_all = pd.DataFrame(priced_cards)
+                                        total_value_all = df_all['Total'].sum()
+                                        
+                                        # Filter for cards $2+
+                                        cards_2plus = [c for c in priced_cards if c['Price'] >= 2.0]
+                                        df_2plus = pd.DataFrame(cards_2plus) if cards_2plus else pd.DataFrame()
+                                        total_value_2plus = df_2plus['Total'].sum() if not df_2plus.empty else 0.0
+                                        
+                                        # Rand values
+                                        total_value_all_rand = total_value_all * USD_TO_ZAR
+                                        total_value_2plus_rand = total_value_2plus * USD_TO_ZAR
+                                        store_offer_usd = total_value_2plus * STORE_OFFER_PERCENT
+                                        store_offer_rand = store_offer_usd * USD_TO_ZAR
+                                        store_credit_usd = total_value_2plus * STORE_CREDIT_PERCENT
+                                        store_credit_rand = store_credit_usd * USD_TO_ZAR
+                                        
+                                        st.header(":moneybag: Deck Summary")
+                                        st.write(f"Total deck worth: {total_value_all:,.2f}  |  R{total_value_all_rand:,.2f}")
+                                        st.write(f"Cards 2 and up worth: {total_value_2plus:,.2f}  |  R{total_value_2plus_rand:,.2f}")
+                                        st.write(f"Store offer (forty percent of 2 and up): {store_offer_usd:,.2f}  |  R{store_offer_rand:,.2f}")
+                                        st.write(f"Store credit (fifty percent of 2 and up): {store_credit_usd:,.2f}  |  R{store_credit_rand:,.2f}")
+                                        st.write("---")
+                                        
+                                        # Show cards
+                                        st.subheader("All Cards")
+                                        if not df_all.empty:
+                                            st.dataframe(df_all, use_container_width=True)
+                                        else:
+                                            st.warning("No cards found in deck.")
+                                        
+                                        st.subheader("Cards 2 and Up (Store Offer Table)")
+                                        if not df_2plus.empty:
+                                            st.dataframe(df_2plus, use_container_width=True)
+                                        else:
+                                            st.warning("No cards 2 or greater found.")
+                                            
+                                    else:
+                                        st.error("Could not fetch prices for cards.")
+                            else:
+                                st.warning("No cards found in deck list.")
+                                
+                        except Exception as e:
+                            st.error(f"Error processing manual deck list: {e}")
 
 
 
