@@ -1167,6 +1167,52 @@ def get_card_prices_from_scryfall(cards):
     
     return priced_cards
 
+def get_card_prices_from_scryfall_with_sets(cards):
+    """Fetches prices for cards from Scryfall API, with set-specific search."""
+    priced_cards = []
+    
+    for card in cards:
+        card_name = card['Name']
+        quantity = card['Quantity']
+        set_id = card.get('Set')
+        
+        try:
+            # Fetch card info from Scryfall with set if available
+            if set_id and set_id not in ['nan', 'none', '']:
+                # Use set ID directly (it's already converted to lowercase)
+                set_code = set_id
+                card_info = fetch_card_info(card_name, set_code=set_code)
+            else:
+                card_info = fetch_card_info(card_name)
+            
+            if card_info and 'usd_price' in card_info:
+                price = float(card_info['usd_price']) if card_info['usd_price'] else 0.0
+            else:
+                price = 0.0
+            
+            priced_cards.append({
+                'Name': card_name,
+                'Quantity': quantity,
+                'Price': price,
+                'Total': quantity * price,
+                'Set': set_id if set_id and set_id not in ['nan', 'none', ''] else 'Unknown'
+            })
+            
+            # Rate limiting
+            time.sleep(0.1)
+            
+        except Exception as e:
+            st.warning(f"Could not fetch price for {card_name}: {e}")
+            priced_cards.append({
+                'Name': card_name,
+                'Quantity': quantity,
+                'Price': 0.0,
+                'Total': 0.0,
+                'Set': set_id if set_id and set_id not in ['nan', 'none', ''] else 'Unknown'
+            })
+    
+    return priced_cards
+
 def parse_manual_deck_list(deck_text):
     """Parses manually entered deck list text."""
     cards = []
@@ -1204,6 +1250,393 @@ def parse_manual_deck_list(deck_text):
                 break
     
     return cards
+
+# Card Examination Functions
+def examine_single_card(card_name, set_name=None):
+    """Examines a single card and shows detailed process information."""
+    st.subheader(f"🔍 Examining: {card_name}")
+    
+    # Create expandable sections for detailed info
+    with st.expander("📋 Input Information", expanded=True):
+        st.write(f"**Card Name:** {card_name}")
+        st.write(f"**Set Name:** {set_name if set_name else 'Not specified'}")
+    
+    with st.expander("🔍 Scryfall API Process", expanded=True):
+        st.write("**Step 1: Set Code Lookup**")
+        set_code = None
+        if set_name and set_name.lower() not in ['nan', 'none', '']:
+            try:
+                st.write(f"Looking up set code for '{set_name}'...")
+                sets_response = requests.get("https://api.scryfall.com/sets")
+                if sets_response.status_code == 200:
+                    sets_data = sets_response.json()['data']
+                    for set_info in sets_data:
+                        if set_info['name'].lower() == set_name.lower():
+                            set_code = set_info['code']
+                            st.success(f"✅ Found set code: {set_code} for '{set_name}'")
+                            break
+                    if not set_code:
+                        st.warning(f"⚠️ Could not find set code for '{set_name}'")
+                else:
+                    st.error(f"❌ Failed to fetch sets from Scryfall: {sets_response.status_code}")
+            except Exception as e:
+                st.error(f"❌ Error during set lookup: {e}")
+        else:
+            st.info("ℹ️ No set name provided, will search without set")
+        
+        st.write("**Step 2: Card Information Fetch**")
+        try:
+            if set_code:
+                st.write(f"Fetching card info with set code: {set_code}")
+                card_info = fetch_card_info(card_name, set_code=set_code)
+            else:
+                st.write("Fetching card info without set code")
+                card_info = fetch_card_info(card_name)
+            
+            if card_info:
+                st.success("✅ Successfully fetched card information")
+                st.write("**Card Details:**")
+                st.write(f"- Name: {card_info.get('name', 'Unknown')}")
+                st.write(f"- Set: {card_info.get('set_name', 'Unknown')}")
+                st.write(f"- USD Price: ${card_info.get('usd_price', 'Unknown')}")
+                st.write(f"- USD Foil Price: ${card_info.get('usd_foil_price', 'Unknown')}")
+                st.write(f"- Image URL: {card_info.get('image_url', 'None')}")
+            else:
+                st.error("❌ Failed to fetch card information")
+        except Exception as e:
+            st.error(f"❌ Error during card fetch: {e}")
+    
+    with st.expander("💰 Price Analysis", expanded=True):
+        try:
+            if set_code:
+                card_info = fetch_card_info(card_name, set_code=set_code)
+            else:
+                card_info = fetch_card_info(card_name)
+            
+            if card_info and 'usd_price' in card_info:
+                price = float(card_info['usd_price']) if card_info['usd_price'] else 0.0
+                price_zar = price * USD_TO_ZAR
+                st.success(f"✅ Price found: ${price:.2f} | R{price_zar:.2f}")
+                
+                if price >= 2.0:
+                    store_offer = price * STORE_OFFER_PERCENT
+                    store_credit = price * STORE_CREDIT_PERCENT
+                    st.write(f"**Store Offer (40%):** ${store_offer:.2f} | R{store_offer * USD_TO_ZAR:.2f}")
+                    st.write(f"**Store Credit (50%):** ${store_credit:.2f} | R{store_credit * USD_TO_ZAR:.2f}")
+                else:
+                    st.info("ℹ️ Card value below $2, not eligible for store offer")
+            else:
+                st.error("❌ No price information available")
+        except Exception as e:
+            st.error(f"❌ Error during price analysis: {e}")
+
+def examine_cards_from_csv(df, card_name_col, set_id_col, quantity_col):
+    """Examines multiple cards from a CSV file."""
+    st.subheader("🔍 CSV Card Examination Results")
+    
+    results = []
+    errors = []
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for index, row in df.iterrows():
+        status_text.text(f"Processing card {index + 1} of {len(df)}: {row[card_name_col]}")
+        progress_bar.progress((index + 1) / len(df))
+        
+        try:
+            card_name = str(row[card_name_col]).strip()
+            set_id = str(row[set_id_col]).strip().lower() if set_id_col and set_id_col in df.columns else None
+            quantity = 1
+            
+            if quantity_col and quantity_col in df.columns:
+                try:
+                    quantity = int(float(row[quantity_col]))
+                except (ValueError, TypeError):
+                    quantity = 1
+            
+            if card_name and card_name.lower() not in ['nan', 'none', '']:
+                # Examine the card
+                card_result = examine_card_detailed(card_name, set_id, quantity)
+                results.append(card_result)
+                
+                if card_result['status'] == 'error':
+                    errors.append(card_result)
+            else:
+                errors.append({
+                    'card_name': card_name,
+                    'set_name': set_id,
+                    'quantity': quantity,
+                    'status': 'error',
+                    'error': 'Empty or invalid card name'
+                })
+        
+        except Exception as e:
+            errors.append({
+                'card_name': str(row[card_name_col]) if card_name_col in df.columns else 'Unknown',
+                'set_name': str(row[set_name_col]) if set_name_col and set_name_col in df.columns else None,
+                'quantity': 1,
+                'status': 'error',
+                'error': str(e)
+            })
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    # Display results
+    if results:
+        st.success(f"✅ Successfully processed {len(results)} cards")
+        
+        # Create results DataFrame
+        results_df = pd.DataFrame(results)
+        st.subheader("📊 Processing Results")
+        st.dataframe(results_df, use_container_width=True)
+        
+        # Summary statistics
+        successful = len([r for r in results if r['status'] == 'success'])
+        failed = len([r for r in results if r['status'] == 'error'])
+        
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Total Cards", len(results))
+        with col2:
+            st.metric("Successful", successful)
+        with col3:
+            st.metric("Failed", failed)
+    
+    if errors:
+        st.error(f"❌ {len(errors)} cards had errors")
+        st.subheader("🚨 Error Details")
+        for error in errors:
+            st.write(f"**{error['card_name']}**: {error['error']}")
+
+def examine_manual_card_list(card_list):
+    """Examines cards from a manual list."""
+    st.subheader("🔍 Manual List Examination Results")
+    
+    lines = card_list.strip().split('\n')
+    cards_to_examine = []
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Parse card name and set
+        card_name = line
+        set_name = None
+        
+        # Check for set in parentheses
+        set_match = re.match(r'(.+?)\s*\(([^)]+)\)', line)
+        if set_match:
+            card_name = set_match.group(1).strip()
+            set_name = set_match.group(2).strip()
+        
+        if card_name:
+            cards_to_examine.append({
+                'name': card_name,
+                'set': set_name
+            })
+    
+    if not cards_to_examine:
+        st.error("No valid cards found in the list")
+        return
+    
+    st.info(f"Found {len(cards_to_examine)} cards to examine")
+    
+    results = []
+    errors = []
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, card in enumerate(cards_to_examine):
+        status_text.text(f"Processing card {i + 1} of {len(cards_to_examine)}: {card['name']}")
+        progress_bar.progress((i + 1) / len(cards_to_examine))
+        
+        try:
+            card_result = examine_card_detailed(card['name'], card['set'], 1)
+            results.append(card_result)
+            
+            if card_result['status'] == 'error':
+                errors.append(card_result)
+        
+        except Exception as e:
+            errors.append({
+                'card_name': card['name'],
+                'set_name': card['set'],
+                'quantity': 1,
+                'status': 'error',
+                'error': str(e)
+            })
+    
+    progress_bar.empty()
+    status_text.empty()
+    
+    # Display results
+    if results:
+        st.success(f"✅ Successfully processed {len(results)} cards")
+        
+        # Create results DataFrame
+        results_df = pd.DataFrame(results)
+        st.subheader("📊 Processing Results")
+        st.dataframe(results_df, use_container_width=True)
+    
+    if errors:
+        st.error(f"❌ {len(errors)} cards had errors")
+        st.subheader("🚨 Error Details")
+        for error in errors:
+            st.write(f"**{error['card_name']}**: {error['error']}")
+
+def examine_card_detailed(card_name, set_id=None, quantity=1):
+    """Examines a single card and returns detailed information."""
+    result = {
+        'card_name': card_name,
+        'set_id': set_id,
+        'quantity': quantity,
+        'status': 'unknown',
+        'usd_price': None,
+        'usd_foil_price': None,
+        'set_code': None,
+        'scryfall_name': None,
+        'error': None
+    }
+    
+    try:
+        # Use set ID directly as set code
+        set_code = None
+        if set_id and set_id not in ['nan', 'none', '']:
+            set_code = set_id  # Already converted to lowercase
+        
+        result['set_code'] = set_code
+        
+        # Fetch card info
+        if set_code:
+            card_info = fetch_card_info(card_name, set_code=set_code)
+        else:
+            card_info = fetch_card_info(card_name)
+        
+        if card_info:
+            result['status'] = 'success'
+            result['usd_price'] = card_info.get('usd_price')
+            result['usd_foil_price'] = card_info.get('usd_foil_price')
+            result['scryfall_name'] = card_info.get('name')
+        else:
+            result['status'] = 'error'
+            result['error'] = 'No card information found'
+    
+    except Exception as e:
+        result['status'] = 'error'
+        result['error'] = str(e)
+    
+    return result
+
+def is_basic_land(handle, title, option1_value):
+    """Detects if a card is a basic land based on handle, title, or option1 value."""
+    basic_lands = ['forest', 'plains', 'mountain', 'swamp', 'island']
+    
+    # Debug: Show what we're checking
+    st.write(f"    🔍 Checking basic land detection:")
+    st.write(f"      Handle: '{handle}'")
+    st.write(f"      Title: '{title}'")
+    st.write(f"      Option1: '{option1_value}'")
+    
+    # Check handle (e.g., "forest-edge-of-eternities")
+    if handle:
+        handle_lower = handle.lower()
+        st.write(f"      Handle lower: '{handle_lower}'")
+        for land in basic_lands:
+            if land in handle_lower:
+                st.write(f"      ✅ Found '{land}' in handle")
+                return True
+    
+    # Check title (e.g., "Forest - Edge of Eternities")
+    if title and not pd.isna(title):
+        title_lower = title.lower()
+        st.write(f"      Title lower: '{title_lower}'")
+        for land in basic_lands:
+            if land in title_lower:
+                st.write(f"      ✅ Found '{land}' in title")
+                return True
+    
+    # Check option1 value
+    if option1_value and not pd.isna(option1_value):
+        option1_lower = option1_value.lower()
+        st.write(f"      Option1 lower: '{option1_lower}'")
+        for land in basic_lands:
+            if land in option1_lower:
+                st.write(f"      ✅ Found '{land}' in option1")
+                return True
+    
+    # Additional checks for common patterns
+    if handle:
+        # Check for patterns like "plains-edge-of-eternities", "mountain-edge-of-eternities", etc.
+        import re
+        basic_land_patterns = [
+            r'^(forest|plains|mountain|swamp|island)-',
+            r'-(forest|plains|mountain|swamp|island)-',
+            r'-(forest|plains|mountain|swamp|island)$'
+        ]
+        
+        for pattern in basic_land_patterns:
+            if re.search(pattern, handle_lower):
+                st.write(f"      ✅ Found basic land pattern '{pattern}' in handle")
+                return True
+    
+    st.write(f"      ❌ No basic land detected")
+    return False
+
+def get_basic_land_name(handle, title, option1_value):
+    """Extracts the basic land name from handle, title, or option1 value."""
+    basic_lands = ['forest', 'plains', 'mountain', 'swamp', 'island']
+    
+    st.write(f"    🔍 Extracting basic land name:")
+    
+    # Try to extract from handle first
+    if handle:
+        handle_lower = handle.lower()
+        st.write(f"      Checking handle: '{handle_lower}'")
+        for land in basic_lands:
+            if land in handle_lower:
+                st.write(f"      ✅ Found '{land}' in handle, returning '{land.title()}'")
+                return land.title()
+    
+    # Try to extract from title
+    if title and not pd.isna(title):
+        title_lower = title.lower()
+        st.write(f"      Checking title: '{title_lower}'")
+        for land in basic_lands:
+            if land in title_lower:
+                st.write(f"      ✅ Found '{land}' in title, returning '{land.title()}'")
+                return land.title()
+    
+    # Try to extract from option1 value
+    if option1_value and not pd.isna(option1_value):
+        option1_lower = option1_value.lower()
+        st.write(f"      Checking option1: '{option1_lower}'")
+        for land in basic_lands:
+            if land in option1_lower:
+                st.write(f"      ✅ Found '{land}' in option1, returning '{land.title()}'")
+                return land.title()
+    
+    # Additional pattern matching for handle
+    if handle:
+        import re
+        basic_land_patterns = [
+            r'^(forest|plains|mountain|swamp|island)-',
+            r'-(forest|plains|mountain|swamp|island)-',
+            r'-(forest|plains|mountain|swamp|island)$'
+        ]
+        
+        for pattern in basic_land_patterns:
+            match = re.search(pattern, handle_lower)
+            if match:
+                land_found = match.group(1)
+                st.write(f"      ✅ Found '{land_found}' via pattern '{pattern}', returning '{land_found.title()}'")
+                return land_found.title()
+    
+    st.write(f"      ❌ Could not extract basic land name")
+    return None
 
 # 7. Main App Logic
 def main():
@@ -1758,35 +2191,47 @@ def main():
                         # Get the first row to extract card name
                         first_row = group.iloc[0]
                         card_name = first_row.get('Title', '')
+                        option1_value = first_row.get('Option1 Value', '')
                         
                         st.write(f"Processing {processed}/{total_products}: '{handle}' with card_name: '{card_name}'")
                         st.write(f"  Raw Title value: {repr(first_row.get('Title', ''))}")
                         st.write(f"  Title type: {type(first_row.get('Title', ''))}")
                         
-                        # Try to extract card name from Option1 Value if Title is NaN
-                        if not card_name or pd.isna(card_name):
-                            option1_value = first_row.get('Option1 Value', '')
-                            st.write(f"  Trying Option1 Value: {option1_value}")
-                            
-                            # Extract card name from Option1 Value (e.g., "Edge of Eternities: Stellar Sights {M} #1 (Foil) [Boosterfun]" -> "Edge of Eternities: Stellar Sights")
-                            if option1_value and not pd.isna(option1_value):
-                                # Remove the set code and collector number
-                                import re
-                                # Remove everything after the first { or [
-                                card_name = re.sub(r'\{.*?\}.*$', '', option1_value).strip()
-                                card_name = re.sub(r'\[.*?\]', '', card_name).strip()
-                                st.write(f"  Extracted card name: '{card_name}'")
+                        # Check if this is a basic land
+                        is_basic_land_card = is_basic_land(handle, card_name, option1_value)
+                        if is_basic_land_card:
+                            st.write(f"  🌲 Detected basic land: {handle}")
+                            basic_land_name = get_basic_land_name(handle, card_name, option1_value)
+                            if basic_land_name:
+                                card_name = basic_land_name
+                                st.write(f"  🌲 Using basic land name: '{card_name}'")
+                            else:
+                                st.write(f"  ⚠️ Could not determine basic land name, skipping")
+                                continue
+                        else:
+                            # Try to extract card name from Option1 Value if Title is NaN
+                            if not card_name or pd.isna(card_name):
+                                st.write(f"  Trying Option1 Value: {option1_value}")
                                 
-                                # The issue is we're getting the set name, not the card name
-                                # We need to extract the actual card name from the handle
-                                # Handle format: "ancient-tomb", "blast-zone", etc.
-                                # Convert handle back to card name
-                                card_name_from_handle = handle.replace('-', ' ').title()
-                                st.write(f"  Card name from handle: '{card_name_from_handle}'")
-                                card_name = card_name_from_handle
-                                
-                                # Debug: Show the exact card name being used for Scryfall
-                                st.write(f"  Final card name for Scryfall: '{card_name}'")
+                                # Extract card name from Option1 Value (e.g., "Edge of Eternities: Stellar Sights {M} #1 (Foil) [Boosterfun]" -> "Edge of Eternities: Stellar Sights")
+                                if option1_value and not pd.isna(option1_value):
+                                    # Remove the set code and collector number
+                                    import re
+                                    # Remove everything after the first { or [
+                                    card_name = re.sub(r'\{.*?\}.*$', '', option1_value).strip()
+                                    card_name = re.sub(r'\[.*?\]', '', card_name).strip()
+                                    st.write(f"  Extracted card name: '{card_name}'")
+                                    
+                                    # The issue is we're getting the set name, not the card name
+                                    # We need to extract the actual card name from the handle
+                                    # Handle format: "ancient-tomb", "blast-zone", etc.
+                                    # Convert handle back to card name
+                                    card_name_from_handle = handle.replace('-', ' ').title()
+                                    st.write(f"  Card name from handle: '{card_name_from_handle}'")
+                                    card_name = card_name_from_handle
+                                    
+                                    # Debug: Show the exact card name being used for Scryfall
+                                    st.write(f"  Final card name for Scryfall: '{card_name}'")
                         
                         if not card_name or pd.isna(card_name):
                             st.write(f"  ⚠️ Skipping - no valid card name")
@@ -2030,7 +2475,7 @@ def main():
         st.write("Calculate the value of your Magic: The Gathering collections and decks. Supports both Deckbox collections and Moxfield decks.")
         
         # Platform selection
-        platform = st.radio("Select platform:", ["Deckbox Collection", "Moxfield Deck"])
+        platform = st.radio("Select platform:", ["Deckbox Collection", "Moxfield Deck", "CSV Upload", "Card Examination"])
         
         if platform == "Deckbox Collection":
             st.subheader("📚 Deckbox Collection")
@@ -2231,6 +2676,187 @@ def main():
                                 
                         except Exception as e:
                             st.error(f"Error processing manual deck list: {e}")
+        
+        elif platform == "CSV Upload":
+            st.subheader("📄 CSV Upload")
+            st.write("Upload a CSV file containing card names, set names, and quantities. The app will match cards with Scryfall data and calculate prices.")
+            
+            # File upload
+            uploaded_file = st.file_uploader("Choose a CSV file", type=['csv'])
+            
+            if uploaded_file is not None:
+                try:
+                    # Read CSV file
+                    df = pd.read_csv(uploaded_file)
+                    st.success(f"Successfully loaded CSV with {len(df)} rows")
+                    
+                    # Show column selection
+                    st.subheader("📋 Column Mapping")
+                    st.write("Please map your CSV columns to the required fields:")
+                    
+                    # Get available columns
+                    available_columns = list(df.columns)
+                    
+                    # Column mapping
+                    col1, col2, col3 = st.columns(3)
+                    with col1:
+                        card_name_col = st.selectbox("Card Name Column:", available_columns, index=0)
+                    with col2:
+                        set_id_col = st.selectbox("Set ID Column:", [""] + available_columns, index=0)
+                    with col3:
+                        quantity_col = st.selectbox("Quantity Column:", available_columns, index=1 if len(available_columns) > 1 else 0)
+                    
+                    # Show preview
+                    st.subheader("📊 CSV Preview")
+                    st.dataframe(df.head(10), use_container_width=True)
+                    
+                    # Process button
+                    if st.button("💰 Calculate Prices", type="primary"):
+                        with st.spinner("Processing CSV and fetching prices from Scryfall..."):
+                            try:
+                                # Process CSV data
+                                cards = []
+                                for index, row in df.iterrows():
+                                    card_name = str(row[card_name_col]).strip()
+                                    quantity = 1  # Default quantity
+                                    
+                                    # Get quantity if column is selected
+                                    if quantity_col and quantity_col in df.columns:
+                                        try:
+                                            quantity = int(float(row[quantity_col]))
+                                        except (ValueError, TypeError):
+                                            quantity = 1
+                                    
+                                    # Skip empty card names
+                                    if card_name and card_name.lower() not in ['nan', 'none', '']:
+                                        set_id = str(row[set_id_col]).strip().lower() if set_id_col and set_id_col in df.columns else None
+                                        cards.append({
+                                            'Name': card_name,
+                                            'Quantity': quantity,
+                                            'Set': set_id
+                                        })
+                                
+                                if cards:
+                                    st.info(f"Found {len(cards)} cards to process")
+                                    
+                                    # Get prices from Scryfall
+                                    priced_cards = get_card_prices_from_scryfall_with_sets(cards)
+                                    
+                                    if priced_cards:
+                                        # Create DataFrame
+                                        df_all = pd.DataFrame(priced_cards)
+                                        total_value_all = df_all['Total'].sum()
+                                        
+                                        # Filter for cards $2+
+                                        cards_2plus = [c for c in priced_cards if c['Price'] >= 2.0]
+                                        df_2plus = pd.DataFrame(cards_2plus) if cards_2plus else pd.DataFrame()
+                                        total_value_2plus = df_2plus['Total'].sum() if not df_2plus.empty else 0.0
+                                        
+                                        # Rand values
+                                        total_value_all_rand = total_value_all * USD_TO_ZAR
+                                        total_value_2plus_rand = total_value_2plus * USD_TO_ZAR
+                                        store_offer_usd = total_value_2plus * STORE_OFFER_PERCENT
+                                        store_offer_rand = store_offer_usd * USD_TO_ZAR
+                                        store_credit_usd = total_value_2plus * STORE_CREDIT_PERCENT
+                                        store_credit_rand = store_credit_usd * USD_TO_ZAR
+                                        
+                                        st.header(":moneybag: Collection Summary")
+                                        st.write(f"Total collection worth: {total_value_all:,.2f}  |  R{total_value_all_rand:,.2f}")
+                                        st.write(f"Cards 2 and up worth: {total_value_2plus:,.2f}  |  R{total_value_2plus_rand:,.2f}")
+                                        st.write(f"Store offer (forty percent of 2 and up): {store_offer_usd:,.2f}  |  R{store_offer_rand:,.2f}")
+                                        st.write(f"Store credit (fifty percent of 2 and up): {store_credit_usd:,.2f}  |  R{store_credit_rand:,.2f}")
+                                        st.write("---")
+                                        
+                                        # Show cards
+                                        st.subheader("All Cards")
+                                        if not df_all.empty:
+                                            st.dataframe(df_all, use_container_width=True)
+                                        else:
+                                            st.warning("No cards found in CSV.")
+                                        
+                                        st.subheader("Cards 2 and Up (Store Offer Table)")
+                                        if not df_2plus.empty:
+                                            st.dataframe(df_2plus, use_container_width=True)
+                                        else:
+                                            st.warning("No cards 2 or greater found.")
+                                            
+                                    else:
+                                        st.error("Could not fetch prices for cards.")
+                                else:
+                                    st.warning("No valid cards found in CSV.")
+                                    
+                            except Exception as e:
+                                st.error(f"Error processing CSV: {e}")
+                                st.write("Debug info:", df.head())
+                except Exception as e:
+                    st.error(f"Error reading CSV file: {e}")
+        
+        elif platform == "Card Examination":
+            st.subheader("🔍 Card Examination Tool")
+            st.write("Examine individual cards and see detailed process information, including any errors in handling.")
+            
+            # Input method selection
+            exam_method = st.radio("Select input method:", ["Single Card", "CSV Upload", "Manual List"])
+            
+            if exam_method == "Single Card":
+                st.write("Enter a single card to examine:")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    card_name = st.text_input("Card Name:", placeholder="Lightning Bolt")
+                with col2:
+                    set_name = st.text_input("Set Name (Optional):", placeholder="Alpha")
+                
+                if st.button("🔍 Examine Card", type="primary"):
+                    if card_name:
+                        with st.spinner("Examining card..."):
+                            examine_single_card(card_name, set_name)
+                    else:
+                        st.error("Please enter a card name.")
+            
+            elif exam_method == "CSV Upload":
+                st.write("Upload a CSV file to examine multiple cards:")
+                
+                uploaded_file = st.file_uploader("Choose a CSV file", type=['csv'], key="exam_csv")
+                
+                if uploaded_file is not None:
+                    try:
+                        df = pd.read_csv(uploaded_file)
+                        st.success(f"Successfully loaded CSV with {len(df)} rows")
+                        
+                        # Column mapping
+                        available_columns = list(df.columns)
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            card_name_col = st.selectbox("Card Name Column:", available_columns, index=0, key="exam_card_col")
+                        with col2:
+                            set_id_col = st.selectbox("Set ID Column:", [""] + available_columns, index=0, key="exam_set_col")
+                        with col3:
+                            quantity_col = st.selectbox("Quantity Column:", available_columns, index=1 if len(available_columns) > 1 else 0, key="exam_qty_col")
+                        
+                        # Show preview
+                        st.subheader("📊 CSV Preview")
+                        st.dataframe(df.head(10), use_container_width=True)
+                        
+                        if st.button("🔍 Examine All Cards", type="primary"):
+                            with st.spinner("Examining all cards..."):
+                                examine_cards_from_csv(df, card_name_col, set_id_col, quantity_col)
+                    except Exception as e:
+                        st.error(f"Error reading CSV file: {e}")
+            
+            elif exam_method == "Manual List":
+                st.write("Enter a list of cards to examine:")
+                st.write("**Format:** One card per line, with optional set (e.g., 'Lightning Bolt (Alpha)' or 'Lightning Bolt')")
+                
+                manual_cards = st.text_area("Enter card list:", height=200, 
+                                          placeholder="Lightning Bolt (Alpha)\nBlack Lotus (Beta)\nCounterspell\n...")
+                
+                if st.button("🔍 Examine Cards", type="primary"):
+                    if manual_cards:
+                        with st.spinner("Examining cards..."):
+                            examine_manual_card_list(manual_cards)
+                    else:
+                        st.error("Please enter some cards to examine.")
 
 
 
