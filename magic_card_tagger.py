@@ -846,28 +846,44 @@ def aggregate_cards(cards):
     return grouped, total_value
 
 # Moxfield Deck Value Calculator Functions
-def extract_moxfield_deck_id(url):
-    """Extracts the deck ID from a Moxfield URL."""
+def extract_moxfield_id(url):
+    """Extracts the deck or collection ID from a Moxfield URL."""
     import re
-    # Handle various Moxfield URL formats
+    # Handle various Moxfield URL formats for decks and collections
     patterns = [
         r'moxfield\.com/decks/([a-zA-Z0-9_-]+)',
         r'moxfield\.com/deck/([a-zA-Z0-9_-]+)',
+        r'moxfield\.com/collection/([a-zA-Z0-9_-]+)',
         r'decks/([a-zA-Z0-9_-]+)',
-        r'deck/([a-zA-Z0-9_-]+)'
+        r'deck/([a-zA-Z0-9_-]+)',
+        r'collection/([a-zA-Z0-9_-]+)'
     ]
     
-    for pattern in patterns:
+    # Debug: print the URL being processed
+    st.write(f"Debug: Processing URL: {url}")
+    
+    for i, pattern in enumerate(patterns):
         match = re.search(pattern, url)
         if match:
+            st.write(f"Debug: Pattern {i} matched: {pattern}")
             return match.group(1)
+    
+    st.write(f"Debug: No patterns matched for URL: {url}")
     return None
 
-def fetch_moxfield_deck(deck_id):
-    """Fetches deck data from Moxfield API."""
+def is_moxfield_collection(url):
+    """Check if the URL is for a collection rather than a deck."""
+    return 'collection' in url.lower()
+
+def fetch_moxfield_data(item_id, is_collection=False):
+    """Fetches deck or collection data from Moxfield API."""
     try:
         # Try the correct API endpoint with more realistic headers
-        url = f"https://api.moxfield.com/v2/decks/all/{deck_id}"
+        if is_collection:
+            url = f"https://api.moxfield.com/v2/collections/{item_id}"
+        else:
+            url = f"https://api.moxfield.com/v2/decks/all/{item_id}"
+        
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'application/json, text/plain, */*',
@@ -889,11 +905,85 @@ def fetch_moxfield_deck(deck_id):
         # If the API fails, try web scraping as fallback
         try:
             st.info("API access failed, trying web scraping...")
-            return scrape_moxfield_deck_web(deck_id)
+            if is_collection:
+                return scrape_moxfield_collection_web(item_id)
+            else:
+                return scrape_moxfield_deck_web(item_id)
         except Exception as scrape_error:
-            st.error(f"Error fetching Moxfield deck: {e}")
+            item_type = "collection" if is_collection else "deck"
+            st.error(f"Error fetching Moxfield {item_type}: {e}")
             st.error(f"Web scraping also failed: {scrape_error}")
             return None
+
+def scrape_moxfield_collection_web(collection_id):
+    """Scrapes collection data from Moxfield web page as fallback."""
+    try:
+        url = f"https://www.moxfield.com/collection/{collection_id}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Referer': 'https://www.moxfield.com/',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'same-origin',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Cache-Control': 'max-age=0'
+        }
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Look for the collection data in the page's JavaScript
+        scripts = soup.find_all('script')
+        collection_data = None
+        
+        for script in scripts:
+            if script.string and 'window.__INITIAL_STATE__' in script.string:
+                # Extract the collection data from the JavaScript
+                import re
+                import json
+                
+                # Find the INITIAL_STATE__ object
+                match = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.*?});', script.string, re.DOTALL)
+                if match:
+                    try:
+                        initial_state = json.loads(match.group(1))
+                        # Navigate to the collection data
+                        if 'collections' in initial_state and collection_id in initial_state['collections']:
+                            collection_data = initial_state['collections'][collection_id]
+                            break
+                    except json.JSONDecodeError:
+                        continue
+        
+        if not collection_data:
+            # Fallback: try to extract from a different script pattern
+            for script in scripts:
+                if script.string and 'collection' in script.string.lower():
+                    # Look for collection data in other script tags
+                    try:
+                        # Try to find collection data in various formats
+                        if '"cards"' in script.string:
+                            # Extract the collection object
+                            collection_match = re.search(r'({[^}]*"cards"[^}]*})', script.string)
+                            if collection_match:
+                                collection_data = json.loads(collection_match.group(1))
+                                break
+                    except:
+                        continue
+        
+        return collection_data
+        
+    except Exception as e:
+        # If JavaScript extraction fails, try direct HTML parsing
+        try:
+            st.info("JavaScript extraction failed, trying direct HTML parsing...")
+            return scrape_moxfield_collection_html(collection_id)
+        except Exception as html_error:
+            raise Exception(f"Web scraping failed: {e}. HTML parsing also failed: {html_error}")
 
 def scrape_moxfield_deck_web(deck_id):
     """Scrapes deck data from Moxfield web page as fallback."""
@@ -964,6 +1054,57 @@ def scrape_moxfield_deck_web(deck_id):
             return scrape_moxfield_deck_html(deck_id)
         except Exception as html_error:
             raise Exception(f"Web scraping failed: {e}. HTML parsing also failed: {html_error}")
+
+def scrape_moxfield_collection_html(collection_id):
+    """Scrapes collection data directly from HTML as final fallback."""
+    try:
+        url = f"https://www.moxfield.com/collection/{collection_id}"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Referer': 'https://www.moxfield.com/',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'same-origin',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Cache-Control': 'max-age=0'
+        }
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Try to extract collection data from HTML
+        cards = []
+        
+        # Look for card elements in the collection page
+        card_elements = soup.find_all(['div', 'span'], class_=lambda x: x and any(word in x.lower() for word in ['card', 'item', 'collection']))
+        
+        for element in card_elements:
+            # Try to extract card name and quantity
+            card_name = element.get_text().strip()
+            if card_name and len(card_name) > 2:  # Basic validation
+                # Try to extract quantity if present
+                quantity_match = re.search(r'(\d+)\s*$', card_name)
+                if quantity_match:
+                    quantity = int(quantity_match.group(1))
+                    card_name = card_name.replace(quantity_match.group(0), '').strip()
+                else:
+                    quantity = 1
+                
+                if card_name:
+                    cards.append({
+                        'name': card_name,
+                        'quantity': quantity
+                    })
+        
+        return {'cards': cards} if cards else None
+        
+    except Exception as e:
+        raise Exception(f"HTML parsing failed: {e}")
 
 def scrape_moxfield_deck_html(deck_id):
     """Scrapes deck data directly from HTML as final fallback."""
@@ -1124,6 +1265,64 @@ def parse_moxfield_deck(deck_data):
     except Exception as e:
         st.error(f"Error parsing Moxfield deck data: {e}")
         st.write("Debug - Deck data structure:", deck_data)
+        return []
+    
+    return cards
+
+def parse_moxfield_collection(collection_data):
+    """Parses Moxfield collection data and extracts card information."""
+    cards = []
+    
+    try:
+        # Handle different data structures from API vs web scraping
+        if isinstance(collection_data, dict):
+            # Extract cards from collection
+            collection_cards = collection_data.get('cards', {})
+            
+            # Process collection cards
+            if isinstance(collection_cards, dict):
+                for card_id, card_info in collection_cards.items():
+                    if isinstance(card_info, dict):
+                        card_name = card_info.get('card', {}).get('name', 'Unknown Card')
+                        quantity = card_info.get('quantity', 1)
+                        cards.append({
+                            'Name': card_name,
+                            'Quantity': quantity,
+                            'Section': 'Collection'
+                        })
+            
+            # Handle alternative structure where cards is a list
+            elif isinstance(collection_cards, list):
+                for card_info in collection_cards:
+                    if isinstance(card_info, dict):
+                        card_name = card_info.get('name', card_info.get('card', {}).get('name', 'Unknown Card'))
+                        quantity = card_info.get('quantity', 1)
+                        cards.append({
+                            'Name': card_name,
+                            'Quantity': quantity,
+                            'Section': 'Collection'
+                        })
+        
+        # If no cards found, try alternative parsing
+        if not cards:
+            st.warning("Could not parse collection data in expected format. Trying alternative parsing...")
+            # Try to extract cards from any available data
+            for key, value in collection_data.items():
+                if isinstance(value, dict) and 'cards' in str(value).lower():
+                    # Look for card data in any structure
+                    for sub_key, sub_value in value.items():
+                        if isinstance(sub_value, dict) and 'name' in sub_value:
+                            card_name = sub_value.get('name', 'Unknown Card')
+                            quantity = sub_value.get('quantity', 1)
+                            cards.append({
+                                'Name': card_name,
+                                'Quantity': quantity,
+                                'Section': 'Collection'
+                            })
+            
+    except Exception as e:
+        st.error(f"Error parsing Moxfield collection data: {e}")
+        st.write("Debug - Collection data structure:", collection_data)
         return []
     
     return cards
@@ -2475,7 +2674,7 @@ def main():
         st.write("Calculate the value of your Magic: The Gathering collections and decks. Supports both Deckbox collections and Moxfield decks.")
         
         # Platform selection
-        platform = st.radio("Select platform:", ["Deckbox Collection", "Moxfield Deck", "CSV Upload", "Card Examination"])
+        platform = st.radio("Select platform:", ["Deckbox Collection", "Moxfield Deck/Collection", "CSV Upload", "Card Examination"])
         
         if platform == "Deckbox Collection":
             st.subheader("📚 Deckbox Collection")
@@ -2522,35 +2721,41 @@ def main():
                         st.error(f"Error: {e}")
         
         elif platform == "Moxfield Deck":
-            st.subheader("🎴 Moxfield Deck")
-            st.write("Enter a Moxfield deck URL to calculate its value. The app will fetch deck data and get current prices from Scryfall.")
+            st.subheader("🎴 Moxfield Deck/Collection")
+            st.write("Enter a Moxfield deck or collection URL to calculate its value. The app will fetch data and get current prices from Scryfall.")
             
             # Add tabs for different input methods
             moxfield_tab1, moxfield_tab2 = st.tabs(["🔗 URL Input", "📝 Manual Input"])
             
             with moxfield_tab1:
-                moxfield_url = st.text_input("Enter your Moxfield deck URL:")
+                moxfield_url = st.text_input("Enter your Moxfield deck or collection URL:")
                 
                 if moxfield_url:
-                    # Extract deck ID from URL
-                    deck_id = extract_moxfield_deck_id(moxfield_url)
+                    # Extract ID from URL and determine if it's a collection
+                    item_id = extract_moxfield_id(moxfield_url)
+                    is_collection = is_moxfield_collection(moxfield_url)
                     
-                    if not deck_id:
-                        st.error("Could not extract deck ID from URL. Please check the URL format.")
+                    if not item_id:
+                        st.error("Could not extract ID from URL. Please check the URL format.")
                     else:
-                        with st.spinner("Fetching deck data from Moxfield..."):
+                        item_type = "collection" if is_collection else "deck"
+                        with st.spinner(f"Fetching {item_type} data from Moxfield..."):
                             try:
-                                # Fetch deck data
-                                deck_data = fetch_moxfield_deck(deck_id)
+                                # Fetch data
+                                data = fetch_moxfield_data(item_id, is_collection=is_collection)
                                 
-                                if deck_data:
-                                    st.success(f"Successfully fetched deck: {deck_data.get('name', 'Unknown Deck')}")
+                                if data:
+                                    item_name = data.get('name', f'Unknown {item_type.title()}')
+                                    st.success(f"Successfully fetched {item_type}: {item_name}")
                                     
-                                    # Parse deck data
-                                    cards = parse_moxfield_deck(deck_data)
+                                    # Parse data
+                                    if is_collection:
+                                        cards = parse_moxfield_collection(data)
+                                    else:
+                                        cards = parse_moxfield_deck(data)
                                     
                                     if cards:
-                                        st.info(f"Found {len(cards)} cards in deck")
+                                        st.info(f"Found {len(cards)} cards in {item_type}")
                                         
                                         # Get prices from Scryfall
                                         with st.spinner("Fetching current prices from Scryfall..."):
@@ -2574,8 +2779,8 @@ def main():
                                                 store_credit_usd = total_value_2plus * STORE_CREDIT_PERCENT
                                                 store_credit_rand = store_credit_usd * USD_TO_ZAR
                                                 
-                                                st.header(":moneybag: Deck Summary")
-                                                st.write(f"Total deck worth: {total_value_all:,.2f}  |  R{total_value_all_rand:,.2f}")
+                                                st.header(f":moneybag: {item_type.title()} Summary")
+                                                st.write(f"Total {item_type} worth: {total_value_all:,.2f}  |  R{total_value_all_rand:,.2f}")
                                                 st.write(f"Cards 2 and up worth: {total_value_2plus:,.2f}  |  R{total_value_2plus_rand:,.2f}")
                                                 st.write(f"Store offer (forty percent of 2 and up): {store_offer_usd:,.2f}  |  R{store_offer_rand:,.2f}")
                                                 st.write(f"Store credit (fifty percent of 2 and up): {store_credit_usd:,.2f}  |  R{store_credit_rand:,.2f}")
@@ -2586,7 +2791,7 @@ def main():
                                                 if not df_all.empty:
                                                     st.dataframe(df_all, use_container_width=True)
                                                 else:
-                                                    st.warning("No cards found in deck.")
+                                                    st.warning(f"No cards found in {item_type}.")
                                                 
                                                 st.subheader("Cards 2 and Up (Store Offer Table)")
                                                 if not df_2plus.empty:
@@ -2597,13 +2802,13 @@ def main():
                                             else:
                                                 st.error("Could not fetch prices for cards.")
                                     else:
-                                        st.warning("No cards found in deck.")
+                                        st.warning(f"No cards found in {item_type}.")
                                 else:
-                                    st.error("Could not fetch deck data from Moxfield.")
+                                    st.error(f"Could not fetch {item_type} data from Moxfield.")
                                     st.info("💡 Try the Manual Input tab if URL access fails.")
                                     
                             except Exception as e:
-                                st.error(f"Error processing Moxfield deck: {e}")
+                                st.error(f"Error processing Moxfield {item_type}: {e}")
                                 st.info("💡 Try the Manual Input tab if URL access fails.")
             
             with moxfield_tab2:
