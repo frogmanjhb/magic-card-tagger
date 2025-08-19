@@ -1,0 +1,5 @@
+Product,Stock,Category,Supplier,Last_Updated
+Widget A,100,Electronics,Supplier A,2024-01-01
+Widget B,50,Electronics,Supplier B,2024-01-01
+Widget C,75,Tools,Supplier C,2024-01-01
+Widget D,25,Tools,Supplier D,2024-01-01

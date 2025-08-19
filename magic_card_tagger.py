@@ -93,6 +93,90 @@ def parse_txt_to_df(txt):
         data.append({'Name': line, 'Quantity': 1})
     return pd.DataFrame(data)
 
+def merge_csv_files_integrated(uploaded_files, merge_strategy, handle_duplicates, separator, encoding):
+    """
+    Merge multiple CSV files based on the specified strategy.
+    
+    Args:
+        uploaded_files: List of uploaded file objects
+        merge_strategy: Strategy for handling columns
+        handle_duplicates: How to handle duplicate rows
+        separator: CSV separator character
+        encoding: File encoding
+    
+    Returns:
+        Merged pandas DataFrame
+    """
+    if not uploaded_files:
+        return None
+    
+    dataframes = []
+    
+    # Read all CSV files
+    for file in uploaded_files:
+        try:
+            df = pd.read_csv(file, sep=separator, encoding=encoding)
+            dataframes.append(df)
+        except Exception as e:
+            st.error(f"Error reading {file.name}: {str(e)}")
+            continue
+    
+    if not dataframes:
+        return None
+    
+    # Apply merge strategy
+    if merge_strategy == "Union (All columns)":
+        # Concatenate all dataframes, filling missing values with NaN
+        merged_df = pd.concat(dataframes, ignore_index=True, sort=False)
+    
+    elif merge_strategy == "Intersection (Common columns only)":
+        # Find common columns across all dataframes
+        common_columns = set(dataframes[0].columns)
+        for df in dataframes[1:]:
+            common_columns = common_columns.intersection(set(df.columns))
+        
+        if not common_columns:
+            st.error("No common columns found across all files!")
+            return None
+        
+        # Keep only common columns and concatenate
+        filtered_dfs = [df[list(common_columns)] for df in dataframes]
+        merged_df = pd.concat(filtered_dfs, ignore_index=True, sort=False)
+    
+    elif merge_strategy == "Custom mapping":
+        # For custom mapping, we'll use the first file as the template
+        # and map other files to match its structure
+        template_df = dataframes[0]
+        template_columns = template_df.columns.tolist()
+        
+        mapped_dfs = [template_df]
+        
+        for df in dataframes[1:]:
+            # Create a new dataframe with template columns
+            mapped_df = pd.DataFrame(columns=template_columns)
+            
+            # Map columns that exist in both dataframes
+            for col in template_columns:
+                if col in df.columns:
+                    mapped_df[col] = df[col]
+                else:
+                    mapped_df[col] = None
+            
+            mapped_dfs.append(mapped_df)
+        
+        merged_df = pd.concat(mapped_dfs, ignore_index=True, sort=False)
+    
+    # Handle duplicates
+    if handle_duplicates == "Remove duplicates":
+        merged_df = merged_df.drop_duplicates()
+    elif handle_duplicates == "Keep first occurrence":
+        merged_df = merged_df.drop_duplicates(keep='first')
+    elif handle_duplicates == "Keep last occurrence":
+        merged_df = merged_df.drop_duplicates(keep='last')
+    
+    return merged_df
+
+
 def calculate_price_with_vat(usd_price, usd_to_zar):
     """Converts USD price to ZAR, adds VAT, and applies price floors (5, 8, 10)."""
     if usd_price is None or usd_to_zar is None:
@@ -523,13 +607,96 @@ def add_shopify_variant(product_id, variant_data):
 # 6. Streamlit UI Functions
 # (For preview, warnings, debug output, etc. If needed, add here)
 
-def adjust_shopify_csv_with_counts(count_df, shopify_df):
-    """Adjust Shopify CSV inventory quantities based on count data."""
+# Add preloaded inventory calculation constants and function
+PRELOADED_INVENTORY = {
+    "C": 30,  # Common cards preloaded amount
+    "U": 13,  # Uncommon cards preloaded amount  
+    "R": 9,   # Rare cards preloaded amount
+    "M": 3    # Mythic cards preloaded amount
+}
+
+def calculate_preloaded_sales(shopify_df):
+    """
+    Calculate how many cards were preloaded (theoretical stock) and how many were preordered.
+    Returns a DataFrame with preloaded amounts and preorder calculations for each card.
+    """
+    preloaded_df = shopify_df.copy()
+    
+    # Add columns for preloaded calculations
+    preloaded_df['Theoretical_Preloaded'] = 0
+    preloaded_df['Preordered_Amount'] = 0
+    preloaded_df['Available_Inventory'] = 0
+    preloaded_df['Preloaded_Notes'] = ''
+    
+    for idx, row in preloaded_df.iterrows():
+        option1_value = row.get('Option1 Value', '')
+        current_inventory = row.get('Variant Inventory Qty', 0)
+        
+        if pd.isna(option1_value) or pd.isna(current_inventory):
+            continue
+            
+        # Extract rarity from Option1 Value (e.g., "Edge of Eternities {R} #1" -> "R")
+        import re
+        rarity_match = re.search(r'\{([CURM])\}', str(option1_value))
+        
+        if rarity_match:
+            rarity = rarity_match.group(1)
+            theoretical_preloaded = PRELOADED_INVENTORY.get(rarity, 0)
+            
+            try:
+                current_qty = int(float(current_inventory))
+                
+                # Calculate how many were preordered
+                # If current inventory is less than theoretical preloaded, the difference was preordered
+                preordered_amount = max(0, theoretical_preloaded - current_qty)
+                
+                # Available inventory is what's currently in Shopify (after preorders)
+                available_inventory = current_qty
+                
+                preloaded_df.loc[idx, 'Theoretical_Preloaded'] = theoretical_preloaded
+                preloaded_df.loc[idx, 'Preordered_Amount'] = preordered_amount
+                preloaded_df.loc[idx, 'Available_Inventory'] = available_inventory
+                preloaded_df.loc[idx, 'Preloaded_Notes'] = f"Rarity {rarity}: {theoretical_preloaded} theoretical, {preordered_amount} preordered"
+                
+            except (ValueError, TypeError):
+                preloaded_df.loc[idx, 'Preloaded_Notes'] = f"Invalid inventory quantity: {current_inventory}"
+        else:
+            preloaded_df.loc[idx, 'Preloaded_Notes'] = "No rarity found in Option1 Value"
+    
+    return preloaded_df
+
+def adjust_shopify_csv_with_counts(count_df, shopify_df, account_for_preloaded=True):
+    """Adjust Shopify CSV inventory quantities based on count data, accounting for preloaded inventory."""
     adjusted_df = shopify_df.copy()
     matches_found = 0
     
-
-
+    # Calculate preloaded inventory if requested
+    if account_for_preloaded:
+        print("Calculating preloaded inventory amounts...")
+        preloaded_df = calculate_preloaded_sales(shopify_df)
+        
+        # Show preloaded inventory summary
+        total_preloaded = preloaded_df['Preloaded_Amount'].sum()
+        print(f"Total preloaded inventory: {total_preloaded} cards")
+        
+        # Show breakdown by rarity
+        rarity_breakdown = {}
+        for idx, row in preloaded_df.iterrows():
+            option1_value = row.get('Option1 Value', '')
+            if pd.notna(option1_value):
+                import re
+                rarity_match = re.search(r'\{([CURM])\}', str(option1_value))
+                if rarity_match:
+                    rarity = rarity_match.group(1)
+                    preloaded_amount = row.get('Preloaded_Amount', 0)
+                    if rarity not in rarity_breakdown:
+                        rarity_breakdown[rarity] = 0
+                    rarity_breakdown[rarity] += preloaded_amount
+        
+        print("Preloaded inventory by rarity:")
+        for rarity, amount in rarity_breakdown.items():
+            print(f"  {rarity} (Rarity): {amount} cards")
+    
     # Find the correct column name for card number
     card_number_col = None
     for col in ['collector_number', 'Card Number', 'card number', 'card number ', 'Card Number', 'card_number', 'CardNumber', 'Number', 'number']:
@@ -648,27 +815,41 @@ def adjust_shopify_csv_with_counts(count_df, shopify_df):
                     current_inventory = adjusted_df.loc[regular_mask, 'Variant Inventory Qty'].values
                     print(f"  Regular - Current inventory values: {current_inventory}")
                     
-                    # Add count sheet quantity to existing inventory
-                    for idx in adjusted_df[regular_mask].index:
-                        existing_qty = adjusted_df.loc[idx, 'Variant Inventory Qty']
-                        if pd.isna(existing_qty) or existing_qty == '':
-                            existing_qty = 0
+                    # Calculate final inventory: Physical Count - Preordered Amount
+                    if account_for_preloaded:
+                        # Get the preorder amount for this card
+                        preloaded_row = preloaded_df[preloaded_df['Handle'] == handle]
+                        preloaded_row = preloaded_row[preloaded_row['Option1 Value'].apply(extract_collector_number) == card_number]
+                        preloaded_row = preloaded_row[~preloaded_row['Option1 Value'].str.contains(r'\(Foil\)', na=False)]
+                        
+                        if not preloaded_row.empty:
+                            preordered_amount = preloaded_row.iloc[0].get('Preordered_Amount', 0)
+                            final_regular_count = regular_count - preordered_amount
+                            print(f"  Regular - Count sheet: {regular_count}, Preordered: {preordered_amount}, Final inventory: {final_regular_count}")
                         else:
-                            try:
-                                existing_qty = int(float(existing_qty))
-                            except (ValueError, TypeError):
-                                existing_qty = 0
+                            final_regular_count = regular_count
+                            print(f"  Regular - No preorder data found, using count sheet: {regular_count}")
+                    else:
+                        final_regular_count = regular_count
+                        print(f"  Regular - Preorder calculation disabled, using count sheet: {regular_count}")
+                    
+                    # Set final inventory (not add to existing)
+                    for idx in adjusted_df[regular_mask].index:
+                        adjusted_df.loc[idx, 'Variant Inventory Qty'] = final_regular_count
+                        print(f"  Regular - Set inventory to: {final_regular_count}")
                         
-                        new_qty = existing_qty + regular_count
-                        adjusted_df.loc[idx, 'Variant Inventory Qty'] = new_qty
-                        print(f"  Regular - Added {regular_count} to existing {existing_qty} = {new_qty}")
-                        
+                        # Add preorder information to the adjusted DataFrame if columns exist
+                        if account_for_preloaded and 'Preordered_Amount' in adjusted_df.columns:
+                            adjusted_df.loc[idx, 'Preordered_Amount'] = preordered_amount if 'preordered_amount' in locals() else 0
+                            adjusted_df.loc[idx, 'Physical_Count'] = regular_count
+                            adjusted_df.loc[idx, 'Final_Inventory'] = final_regular_count
+                            adjusted_df.loc[idx, 'Preloaded_Notes'] = f"Physical: {regular_count}, Preordered: {preordered_amount if 'preordered_amount' in locals() else 0}, Final: {final_regular_count}"
 
                     
                     updated_inventory = adjusted_df.loc[regular_mask, 'Variant Inventory Qty'].values
                     print(f"  Regular - Updated inventory values: {updated_inventory}")
                     matches_found += 1
-                    print(f"✅ Updated regular {card_name} #{card_number} with quantity {regular_count}")
+                    print(f"✅ Updated regular {card_name} #{card_number} with quantity {adjusted_regular_count}")
                 else:
                     print(f"❌ No regular variant found for {card_name} #{card_number}")
             
@@ -706,27 +887,42 @@ def adjust_shopify_csv_with_counts(count_df, shopify_df):
                     current_inventory = adjusted_df.loc[foil_mask, 'Variant Inventory Qty'].values
                     print(f"  Foil - Current inventory values: {current_inventory}")
                     
-                    # Add count sheet quantity to existing inventory
-                    for idx in adjusted_df[foil_mask].index:
-                        existing_qty = adjusted_df.loc[idx, 'Variant Inventory Qty']
-                        if pd.isna(existing_qty) or existing_qty == '':
-                            existing_qty = 0
-                        else:
-                            try:
-                                existing_qty = int(float(existing_qty))
-                            except (ValueError, TypeError):
-                                existing_qty = 0
+                    # Calculate final inventory: Physical Count - Preordered Amount
+                    if account_for_preloaded:
+                        # Get the preorder amount for this card
+                        preloaded_row = preloaded_df[preloaded_df['Handle'] == handle]
+                        preloaded_row = preloaded_row[preloaded_row['Option1 Value'].apply(extract_collector_number) == card_number]
+                        preloaded_row = preloaded_row[preloaded_row['Option1 Value'].str.contains(r'\(Foil\)', na=False)]
                         
-                        new_qty = existing_qty + foil_count
-                        adjusted_df.loc[idx, 'Variant Inventory Qty'] = new_qty
-                        print(f"  Foil - Added {foil_count} to existing {existing_qty} = {new_qty}")
+                        if not preloaded_row.empty:
+                            preordered_amount = preloaded_row.iloc[0].get('Preordered_Amount', 0)
+                            final_foil_count = foil_count - preordered_amount
+                            print(f"  Foil - Count sheet: {foil_count}, Preordered: {preordered_amount}, Final inventory: {final_foil_count}")
+                        else:
+                            final_foil_count = foil_count
+                            print(f"  Foil - No preorder data found, using count sheet: {foil_count}")
+                    else:
+                        final_foil_count = foil_count
+                        print(f"  Foil - Preorder calculation disabled, using count sheet: {foil_count}")
+                    
+                    # Set final inventory (not add to existing)
+                    for idx in adjusted_df[foil_mask].index:
+                        adjusted_df.loc[idx, 'Variant Inventory Qty'] = final_foil_count
+                        print(f"  Foil - Set inventory to: {final_foil_count}")
+                        
+                        # Add preorder information to the adjusted DataFrame if columns exist
+                        if account_for_preloaded and 'Preordered_Amount' in adjusted_df.columns:
+                            adjusted_df.loc[idx, 'Preordered_Amount'] = preordered_amount if 'preordered_amount' in locals() else 0
+                            adjusted_df.loc[idx, 'Physical_Count'] = foil_count
+                            adjusted_df.loc[idx, 'Final_Inventory'] = final_foil_count
+                            adjusted_df.loc[idx, 'Preloaded_Notes'] = f"Physical: {foil_count}, Preordered: {preordered_amount if 'preordered_amount' in locals() else 0}, Final: {final_foil_count}"
                     
                     updated_inventory = adjusted_df.loc[foil_mask, 'Variant Inventory Qty'].values
                     print(f"  Foil - Updated inventory values: {updated_inventory}")
                     matches_found += 1
-                    print(f"✅ Updated foil {card_name} #{card_number} with quantity {foil_count}")
+                    print(f"✅ Updated foil {card_name} #{card_number} with quantity {adjusted_foil_count}")
                 else:
-                    print(f"❌ No existing foil variant found for {card_name} #{card_number} - foil count {foil_count} will not be added")
+                    print(f"❌ No existing foil variant found for {card_name} #{card_number} - foil count {adjusted_foil_count if 'adjusted_foil_count' in locals() else foil_count} will not be added")
                     
         except Exception as e:
             print(f"Error processing row for card: {card_name if 'card_name' in locals() else 'unknown'}")
@@ -735,6 +931,15 @@ def adjust_shopify_csv_with_counts(count_df, shopify_df):
             continue
 
     print(f"\nTotal matches found: {matches_found}")
+    
+    # Add preorder inventory columns to the final output if they don't exist
+    if account_for_preloaded and 'Preordered_Amount' not in adjusted_df.columns:
+        adjusted_df['Theoretical_Preloaded'] = 0
+        adjusted_df['Preordered_Amount'] = 0
+        adjusted_df['Physical_Count'] = 0
+        adjusted_df['Final_Inventory'] = 0
+        adjusted_df['Preloaded_Notes'] = ''
+    
     return adjusted_df
 
 # Deckbox Collection Value Calculator Functions
@@ -1899,6 +2104,10 @@ def main():
             if st.button("💰 Price Check & Update", use_container_width=True):
                 st.session_state.current_page = "Price Check & Update"
                 st.rerun()
+            
+            if st.button("🔗 CSV Merger", use_container_width=True):
+                st.session_state.current_page = "CSV Merger"
+                st.rerun()
     
     # Navigation logic
     page = st.session_state.current_page
@@ -2263,6 +2472,41 @@ def main():
         The count sheet should contain: card_name, set_name, collector_number, inventory_quantity, and Foil inventory_quantity.
         """)
         
+        # Add preloaded inventory configuration
+        st.subheader("⚙️ Preloaded Inventory Configuration")
+        st.markdown("""
+        **Preloaded Inventory**: Cards that are preloaded into Shopify before official release.
+        The app will automatically calculate and account for these preloaded amounts based on rarity.
+        """)
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Common (C)", f"{PRELOADED_INVENTORY['C']} cards")
+        with col2:
+            st.metric("Uncommon (U)", f"{PRELOADED_INVENTORY['U']} cards")
+        with col3:
+            st.metric("Rare (R)", f"{PRELOADED_INVENTORY['R']} cards")
+        with col4:
+            st.metric("Mythic (M)", f"{PRELOADED_INVENTORY['M']} cards")
+        
+        # Option to enable/disable preloaded calculation
+        account_for_preloaded = st.checkbox(
+            "Account for preloaded inventory", 
+            value=True, 
+            help="When enabled, the app will add preloaded amounts to count sheet quantities to match Shopify inventory"
+        )
+        
+        if account_for_preloaded:
+            st.info("""
+            **How it works:**
+            1. The app reads the current Shopify inventory
+            2. Calculates how many cards were preordered based on rarity (C=30, U=13, R=9, M=3)
+            3. Subtracts the preordered amount from your count sheet quantity
+            4. This ensures the final inventory shows what's actually available for sale
+            
+            **Example:** If you count 40 Common cards and 5 were preordered, the app will set inventory to 40 - 5 = 35 available cards
+            """)
+        
         col1, col2 = st.columns(2)
         
         with col1:
@@ -2290,6 +2534,66 @@ def main():
                 shopify_available_cols = [col for col in shopify_preview_cols if col in shopify_df.columns]
                 st.dataframe(shopify_df[shopify_available_cols].head(10), use_container_width=True)
                 
+                # Show preloaded inventory analysis if enabled
+                if account_for_preloaded:
+                    st.subheader("📊 Preloaded Inventory Analysis")
+                    try:
+                        preloaded_df = calculate_preloaded_sales(shopify_df)
+                        
+                        # Show summary statistics
+                        total_theoretical = preloaded_df['Theoretical_Preloaded'].sum()
+                        total_preordered = preloaded_df['Preordered_Amount'].sum()
+                        total_current_inventory = preloaded_df['Variant Inventory Qty'].sum()
+                        
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Theoretical Preloaded", f"{total_theoretical} cards")
+                        with col2:
+                            st.metric("Total Preordered", f"{total_preordered} cards")
+                        with col3:
+                            st.metric("Current Shopify Inventory", f"{total_current_inventory} cards")
+                        
+                        # Show breakdown by rarity
+                        rarity_breakdown = {}
+                        for idx, row in preloaded_df.iterrows():
+                            option1_value = row.get('Option1 Value', '')
+                            if pd.notna(option1_value):
+                                import re
+                                rarity_match = re.search(r'\{([CURM])\}', str(option1_value))
+                                if rarity_match:
+                                    rarity = rarity_match.group(1)
+                                    theoretical_amount = row.get('Theoretical_Preloaded', 0)
+                                    if rarity not in rarity_breakdown:
+                                        rarity_breakdown[rarity] = 0
+                                    rarity_breakdown[rarity] += theoretical_amount
+                        
+                        if rarity_breakdown:
+                            st.write("**Theoretical preloaded inventory by rarity:**")
+                            rarity_cols = st.columns(len(rarity_breakdown))
+                            for i, (rarity, amount) in enumerate(rarity_breakdown.items()):
+                                with rarity_cols[i]:
+                                    st.metric(f"{rarity} (Rarity)", f"{amount} cards")
+                        
+                        # Show detailed preloaded data
+                        with st.expander("📋 Detailed Preloaded Inventory Data"):
+                            preloaded_display_cols = ['Handle', 'Title', 'Option1 Value', 'Variant Inventory Qty', 'Theoretical_Preloaded', 'Preordered_Amount', 'Available_Inventory', 'Preloaded_Notes']
+                            available_display_cols = [col for col in preloaded_display_cols if col in preloaded_df.columns]
+                            st.dataframe(preloaded_df[available_display_cols].head(20), use_container_width=True)
+                            
+                            # Download preloaded analysis
+                            preloaded_output = io.StringIO()
+                            preloaded_df.to_csv(preloaded_output, index=False)
+                            st.download_button(
+                                "Download Preloaded Inventory Analysis", 
+                                data=preloaded_output.getvalue(), 
+                                file_name="preloaded_inventory_analysis.csv", 
+                                mime="text/csv"
+                            )
+                    
+                    except Exception as e:
+                        st.warning(f"Could not analyze preloaded inventory: {str(e)}")
+                        st.info("This usually means the Shopify CSV doesn't have the expected format for rarity extraction")
+                
                 if st.button("Adjust Inventory Quantities"):
                     st.info("Processing inventory adjustments...")
                     
@@ -2301,13 +2605,43 @@ def main():
                     st.write(f"Sample Shopify data:")
                     st.write(shopify_df[['Title', 'Option1 Value', 'Variant Inventory Qty']].head(3))
                     
-                    adjusted_df = adjust_shopify_csv_with_counts(count_df, shopify_df)
+                    adjusted_df = adjust_shopify_csv_with_counts(count_df, shopify_df, account_for_preloaded)
                     
                     st.success(f"Created {len(adjusted_df)} inventory records")
                     
+                    # Show summary of adjustments
+                    if account_for_preloaded:
+                        st.subheader("📈 Inventory Adjustment Summary")
+                        
+                        # Calculate totals
+                        total_count_sheet = count_df['inventory_quantity'].sum() + count_df['Foil inventory_quantity'].sum()
+                        total_adjusted = adjusted_df['Variant Inventory Qty'].sum() if 'Variant Inventory Qty' in adjusted_df.columns else 0
+                        total_preordered = adjusted_df['Preordered_Amount'].sum() if 'Preordered_Amount' in adjusted_df.columns else 0
+                        
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.metric("Physical Count Total", f"{total_count_sheet} cards")
+                        with col2:
+                            st.metric("Total Preordered", f"{total_preordered} cards")
+                        with col3:
+                            st.metric("Final Inventory", f"{total_adjusted} cards")
+                        
+                        st.info(f"""
+                        **Adjustment Process:**
+                        - Physical Count: {total_count_sheet} cards
+                        - Preordered Cards: -{total_preordered} cards
+                        - **Final Inventory: {total_adjusted} cards**
+                        
+                        This ensures your Shopify inventory shows what's actually available for sale.
+                        """)
+                    
                     # Show preview of adjusted data
                     st.subheader("Adjusted Inventory Preview")
-                    preview_cols = ['Title', 'Option1 Value', 'Variant Inventory Qty', 'Variant Price']
+                    if account_for_preloaded and 'Preordered_Amount' in adjusted_df.columns:
+                        preview_cols = ['Title', 'Option1 Value', 'Variant Inventory Qty', 'Physical_Count', 'Preordered_Amount', 'Final_Inventory', 'Variant Price']
+                    else:
+                        preview_cols = ['Title', 'Option1 Value', 'Variant Inventory Qty', 'Variant Price']
+                    
                     available_cols = [col for col in preview_cols if col in adjusted_df.columns]
                     st.dataframe(adjusted_df[available_cols].head(10), use_container_width=True)
                     
@@ -3062,6 +3396,302 @@ def main():
                             examine_manual_card_list(manual_cards)
                     else:
                         st.error("Please enter some cards to examine.")
+
+    # CSV Merger functionality
+    elif page == "CSV Merger":
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            if st.button("🏠 Back to Home"):
+                st.session_state.current_page = "Home"
+                st.rerun()
+        with col2:
+            st.header("🔗 CSV Merger")
+        
+        st.markdown("""
+        Upload multiple CSV files and merge them into one consolidated file with flexible merge strategies.
+        """)
+        
+        # Initialize session state for CSV merger
+        if 'csv_merger_files' not in st.session_state:
+            st.session_state.csv_merger_files = []
+        if 'csv_merged_data' not in st.session_state:
+            st.session_state.csv_merged_data = None
+        
+        # Sidebar for merge options
+        with st.sidebar:
+            st.header("⚙️ Merge Options")
+            
+            # Merge strategy
+            merge_strategy = st.selectbox(
+                "Merge Strategy",
+                ["Union (All columns)", "Intersection (Common columns only)", "Custom mapping"],
+                help="Choose how to handle columns when merging files"
+            )
+            
+            # Handle duplicates
+            handle_duplicates = st.selectbox(
+                "Handle Duplicates",
+                ["Keep all", "Remove duplicates", "Keep first occurrence", "Keep last occurrence"],
+                help="Choose how to handle duplicate rows"
+            )
+            
+            # Index handling
+            reset_index = st.checkbox("Reset index in output", value=True)
+            
+            # Separator options
+            separator = st.selectbox(
+                "CSV Separator",
+                [",", ";", "\t", "|"],
+                help="Choose the separator used in your CSV files"
+            )
+            
+            # Encoding options
+            encoding = st.selectbox(
+                "File Encoding",
+                ["utf-8", "latin-1", "cp1252", "iso-8859-1"],
+                help="Choose the encoding of your CSV files"
+            )
+        
+        # Main content area
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            st.markdown("""
+            <div style="background-color: #f0f2f6; padding: 1.5rem; border-radius: 10px; margin: 1rem 0;">
+            """, unsafe_allow_html=True)
+            st.subheader("📁 Upload CSV Files")
+            
+            uploaded_files = st.file_uploader(
+                "Choose CSV files to merge",
+                type=['csv'],
+                accept_multiple_files=True,
+                help="You can select multiple CSV files at once",
+                key="csv_merger_uploader"
+            )
+            
+            if uploaded_files:
+                # Store uploaded files in session state
+                st.session_state.csv_merger_files = uploaded_files
+                
+                # Display file information
+                st.markdown("### 📋 File Information")
+                for i, file in enumerate(uploaded_files):
+                    try:
+                        # Try to read the file to get basic info
+                        df = pd.read_csv(file, sep=separator, encoding=encoding)
+                        file.seek(0)  # Reset file pointer
+                        
+                        st.markdown(f"""
+                        <div style="background-color: #e8f4fd; padding: 1rem; border-radius: 8px; margin: 0.5rem 0; border-left: 4px solid #1f77b4;">
+                            <strong>File {i+1}:</strong> {file.name}<br>
+                            <strong>Size:</strong> {file.size} bytes<br>
+                            <strong>Rows:</strong> {len(df)}<br>
+                            <strong>Columns:</strong> {len(df.columns)}<br>
+                            <strong>Columns:</strong> {', '.join(df.columns[:5])}{'...' if len(df.columns) > 5 else ''}
+                        </div>
+                        """, unsafe_allow_html=True)
+                    except Exception as e:
+                        st.error(f"Error reading {file.name}: {str(e)}")
+            
+            st.markdown("</div>", unsafe_allow_html=True)
+        
+        with col2:
+            st.markdown("""
+            <div style="background-color: #fff3cd; padding: 1.5rem; border-radius: 10px; margin: 1rem 0; border: 1px solid #ffeaa7;">
+            """, unsafe_allow_html=True)
+            st.subheader("🔄 Merge Actions")
+            
+            if st.session_state.csv_merger_files:
+                if st.button("🚀 Merge Files", type="primary", use_container_width=True, key="csv_merge_button"):
+                    with st.spinner("Merging files..."):
+                        try:
+                            merged_df = merge_csv_files_integrated(
+                                st.session_state.csv_merger_files,
+                                merge_strategy,
+                                handle_duplicates,
+                                separator,
+                                encoding
+                            )
+                            
+                            if merged_df is not None:
+                                st.session_state.csv_merged_data = merged_df
+                                st.success(f"✅ Successfully merged {len(st.session_state.csv_merger_files)} files!")
+                                st.success(f"📊 Total rows: {len(merged_df)}, Total columns: {len(merged_df.columns)}")
+                            else:
+                                st.error("❌ Failed to merge files. Please check your file formats.")
+                        except Exception as e:
+                            st.error(f"❌ Error during merge: {str(e)}")
+                
+                if st.session_state.csv_merged_data is not None:
+                    st.markdown("### 💾 Download Options")
+                    
+                    # CSV download
+                    csv_buffer = io.StringIO()
+                    st.session_state.csv_merged_data.to_csv(csv_buffer, index=reset_index, sep=separator)
+                    csv_str = csv_buffer.getvalue()
+                    
+                    st.download_button(
+                        label="📥 Download Merged CSV",
+                        data=csv_str,
+                        file_name="merged_data.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+                    
+                    # Excel download (if pandas supports it)
+                    try:
+                        excel_buffer = io.BytesIO()
+                        with pd.ExcelWriter(excel_buffer, engine='openpyxl') as writer:
+                            st.session_state.csv_merged_data.to_excel(writer, index=reset_index, sheet_name='Merged Data')
+                        excel_buffer.seek(0)
+                        
+                        st.download_button(
+                            label="📥 Download as Excel",
+                            data=excel_buffer.getvalue(),
+                            file_name="merged_data.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True
+                        )
+                    except ImportError:
+                        st.info("💡 Install 'openpyxl' for Excel export support: `pip install openpyxl`")
+                    except Exception as e:
+                        st.info(f"💡 Excel export not available: {str(e)}")
+            
+            st.markdown("</div>", unsafe_allow_html=True)
+        
+        # Display merged data preview
+        if st.session_state.csv_merged_data is not None:
+            st.markdown("### 📊 Merged Data Preview")
+            
+            # Show basic statistics
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Rows", len(st.session_state.csv_merged_data))
+            with col2:
+                st.metric("Total Columns", len(st.session_state.csv_merged_data.columns))
+            with col3:
+                st.metric("Memory Usage", f"{st.session_state.csv_merged_data.memory_usage(deep=True).sum() / 1024:.1f} KB")
+            with col4:
+                st.metric("Data Types", len(st.session_state.csv_merged_data.dtypes.unique()))
+            
+            # Data preview with pagination
+            rows_per_page = st.slider("Rows per page", 10, 100, 50)
+            total_pages = (len(st.session_state.csv_merged_data) - 1) // rows_per_page + 1
+            
+            if total_pages > 1:
+                page_num = st.selectbox("Page", range(1, total_pages + 1)) - 1
+                start_idx = page_num * rows_per_page
+                end_idx = min(start_idx + rows_per_page, len(st.session_state.csv_merged_data))
+                
+                st.dataframe(
+                    st.session_state.csv_merged_data.iloc[start_idx:end_idx],
+                    use_container_width=True
+                )
+                st.caption(f"Showing rows {start_idx + 1}-{end_idx} of {len(st.session_state.csv_merged_data)}")
+            else:
+                st.dataframe(st.session_state.csv_merged_data, use_container_width=True)
+            
+            # Column information
+            with st.expander("📋 Column Information"):
+                col_info = []
+                for col in st.session_state.csv_merged_data.columns:
+                    dtype = str(st.session_state.csv_merged_data[col].dtype)
+                    non_null = st.session_state.csv_merged_data[col].count()
+                    null_count = st.session_state.csv_merged_data[col].isnull().sum()
+                    unique_count = st.session_state.csv_merged_data[col].nunique()
+                    
+                    col_info.append({
+                        'Column': col,
+                        'Data Type': dtype,
+                        'Non-Null Count': non_null,
+                        'Null Count': null_count,
+                        'Unique Values': unique_count
+                    })
+                
+                col_info_df = pd.DataFrame(col_info)
+                st.dataframe(col_info_df, use_container_width=True)
+        
+        # Help section
+        with st.expander("❓ CSV Merger Help"):
+            st.markdown("""
+            ## 📖 How to Use CSV Merger
+            
+            ### 1. Upload Files
+            - Click "Browse files" to select multiple CSV files
+            - Supported format: CSV files
+            - You can select multiple files at once
+            
+            ### 2. Configure Options
+            - **Merge Strategy**: Choose how to handle columns
+              - Union: Keep all columns from all files
+              - Intersection: Keep only columns present in all files
+              - Custom mapping: Use first file as template
+            - **Handle Duplicates**: Choose how to handle duplicate rows
+            - **Separator**: Choose the character that separates values in your CSV
+            - **Encoding**: Choose the file encoding
+            
+            ### 3. Merge and Download
+            - Click "Merge Files" to combine your data
+            - Preview the merged data
+            - Download as CSV or Excel format
+            
+            ### Tips
+            - Make sure your CSV files have consistent column names for best results
+            - Use "Intersection" strategy if you want to ensure all files have the same structure
+            - Check the preview before downloading to ensure data integrity
+            """)
+        
+        # Help section
+        with st.expander("❓ How Preloaded Inventory Works"):
+            st.markdown("""
+            ## 📖 Understanding Preloaded Inventory
+            
+            ### What is Preloaded Inventory?
+            Preloaded inventory refers to cards that are added to Shopify **before** a new Magic set officially releases. 
+            This allows customers to preorder cards and see them in your store.
+            
+            ### Preloaded Amounts by Rarity
+            - **Common (C)**: 30 cards preloaded
+            - **Uncommon (U)**: 13 cards preloaded  
+            - **Rare (R)**: 9 cards preloaded
+            - **Mythic (M)**: 3 cards preloaded
+            
+            ### Why This Matters
+            When you do a physical count after release, you might count:
+            - **Count Sheet**: 5 Common cards
+            - **Shopify Shows**: 35 Common cards
+            
+            The difference (30 cards) represents the preloaded amount that was "sold" before release.
+            
+            ### How the App Handles This
+            1. **Reads Shopify CSV**: Gets current inventory levels
+            2. **Extracts Rarity**: From Option1 Value (e.g., "{R}" for Rare)
+            3. **Calculates Preordered**: Determines how many were preordered from theoretical stock
+            4. **Adjusts Counts**: Subtracts preordered amounts from your count sheet
+            5. **Final Result**: Shopify inventory shows what's actually available for sale
+            
+            ### Example Calculation
+            ```
+            Card: Lightning Bolt (Common)
+            Physical Count: 40 cards
+            Theoretical Preloaded: 30 cards (Common)
+            Preordered: 5 cards
+            Available for Sale: 40 - 5 = 35 cards ✅
+            ```
+            
+            ### When to Use This Feature
+            - ✅ New set releases with preorders
+            - ✅ Inventory reconciliation after preorder fulfillment
+            - ✅ Auditing physical vs. digital inventory
+            - ❌ Regular inventory updates (disable the feature)
+            
+            ### File Format Requirements
+            Your Shopify CSV must have:
+            - `Option1 Value` column with format: "Set Name {R} #123" or "Set Name {R} #123 (Foil)"
+            - `Variant Inventory Qty` column with current inventory numbers
+            
+            The app automatically detects rarity from the `{C}`, `{U}`, `{R}`, or `{M}` codes.
+            """)
 
 
 
